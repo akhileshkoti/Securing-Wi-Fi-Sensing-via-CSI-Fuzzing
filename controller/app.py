@@ -110,12 +110,14 @@ def bistatic_ellipse(tx, rx, a):
         pts.append([round(wx,4), round(wy,4)])
     return pts
 
-def ellipse_grid_score(tx, rx, a, grid_pts):
+def ellipse_grid_score(tx, rx, a, grid_pts, sigma):
     """
     For each grid point return how close it is to the ellipse surface.
-    Score = exp(-dist_to_ellipse^2 / sigma^2), sigma ~ 0.3m.
+    Score = exp(-dist_to_ellipse^2 / sigma^2). sigma is the arc thickness in
+    metres -- pass a room-scaled value (see compute_localization) so this
+    isn't tuned to one fixed room size.
     """
-    sigma2 = 0.09   # 0.3m^2
+    sigma2 = sigma * sigma
     scores = []
     c = _dist(tx, rx)/2
     if a < c:
@@ -181,6 +183,14 @@ def compute_localization(mac_covs, mac_baselines):
     """
     GRID_N = 30   # 30x30 grid over the room
 
+    # Ellipse arc thickness scales with room size instead of a value fixed
+    # to the room this was first tuned in -- otherwise a much larger room
+    # is undersensitive (arc too thin relative to the space) and a much
+    # smaller one oversensitive (arc too thick). Fraction reproduces the
+    # originally-tuned 0.3m arc at this room's 2.743m short side.
+    SIGMA_FRACTION = 0.1094
+    sigma = SIGMA_FRACTION * min(ROOM_W, ROOM_H)
+
     # build grid points
     grid_pts = []
     for gy in range(GRID_N):
@@ -209,7 +219,7 @@ def compute_localization(mac_covs, mac_baselines):
         delta = excess * ELONGATION_SCALE
         a = c + delta + 0.01   # +0.01 so ellipse is never degenerate
 
-        scores = ellipse_grid_score(tx_pos, RX_POS, a, grid_pts)
+        scores = ellipse_grid_score(tx_pos, RX_POS, a, grid_pts, sigma)
         for i, s in enumerate(scores):
             combined[i] += s
         active_links += 1
