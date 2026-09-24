@@ -498,12 +498,12 @@
 
             // presence heatmap grid
             if (loc && loc.scores && loc.scores.length > 0) {
-                const n = loc.grid_n;
-                const cellW = CANVAS_W / n;
-                const cellH = CANVAS_H / n;
-                for (let gy = 0; gy < n; gy++) {
-                    for (let gx = 0; gx < n; gx++) {
-                        const score = loc.scores[gy * n + gx];
+                const nx = loc.grid_n_x, ny = loc.grid_n_y;
+                const cellW = CANVAS_W / nx;
+                const cellH = CANVAS_H / ny;
+                for (let gy = 0; gy < ny; gy++) {
+                    for (let gx = 0; gx < nx; gx++) {
+                        const score = loc.scores[gy * nx + gx];
                         if (score < 0.05) continue;
                         const alpha = score * 0.7;
                         // blue->cyan->yellow based on score
@@ -513,7 +513,7 @@
                         roomCtx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
                         // canvas y is flipped relative to world y
                         const cx = gx * cellW;
-                        const cy = (n - 1 - gy) * cellH;
+                        const cy = (ny - 1 - gy) * cellH;
                         roomCtx.fillRect(cx, cy, cellW + 1, cellH + 1);
                     }
                 }

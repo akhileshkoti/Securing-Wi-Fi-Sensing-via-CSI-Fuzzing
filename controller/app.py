@@ -130,8 +130,8 @@ def ellipse_grid_score(tx, rx, a, grid_pts, sigma):
 
 def refine_intersection(p0, links, rx, room_w, room_h, iters=150):
     """
-    The grid heatmap's arg-max is a coarse (room_w/(GRID_N-1) cell size)
-    score peak, not the actual ellipse intersection -- it never solves the
+    The grid heatmap's arg-max is a coarse (one grid cell wide) score peak,
+    not the actual ellipse intersection -- it never solves the
     "two links, one point" geometry the localization is supposed to be
     doing. This refines p0 via gradient descent on the sum of squared
     ellipse-equation residuals (dist(tx,p)+dist(p,rx) - 2a) across all
@@ -175,13 +175,23 @@ def compute_localization(mac_covs, mac_baselines):
     compute a presence heatmap over the room grid and candidate blob position.
 
     Returns dict with keys:
-      grid_w, grid_h  -- grid dimensions
-      scores          -- flat list of floats [0,1], row-major
-      blob            -- {x,y,confidence} or None
-      ellipses        -- list of {tx, rx, pts} for drawing
-      nodes           -- list of {label, x, y, type}
+      grid_n_x, grid_n_y -- grid dimensions (room-size-adaptive, see below)
+      scores             -- flat list of floats [0,1], row-major (grid_n_x per row)
+      blob               -- {x,y,confidence} or None
+      ellipses           -- list of {tx, rx, pts} for drawing
+      nodes              -- list of {label, x, y, type}
     """
-    GRID_N = 30   # 30x30 grid over the room
+    # Grid resolution scales with room size instead of a fixed 30x30 point
+    # count -- a fixed count makes cells coarser as the room grows (and
+    # wastes resolution on a small room). TARGET_CELL_M reproduces the
+    # ~9.5cm cells the localization was validated with in the original
+    # 2.743x4.877m room; MIN/MAX_GRID_N bound both ends (a tiny room still
+    # gets a usable grid, a huge room can't blow up per-tick compute at
+    # EMIT_HZ).
+    TARGET_CELL_M = 0.095
+    MIN_GRID_N, MAX_GRID_N = 15, 60
+    grid_n_x = min(MAX_GRID_N, max(MIN_GRID_N, round(ROOM_W / TARGET_CELL_M) + 1))
+    grid_n_y = min(MAX_GRID_N, max(MIN_GRID_N, round(ROOM_H / TARGET_CELL_M) + 1))
 
     # Ellipse arc thickness scales with room size instead of a value fixed
     # to the room this was first tuned in -- otherwise a much larger room
@@ -191,15 +201,15 @@ def compute_localization(mac_covs, mac_baselines):
     SIGMA_FRACTION = 0.1094
     sigma = SIGMA_FRACTION * min(ROOM_W, ROOM_H)
 
-    # build grid points
+    # build grid points (row-major: grid_n_x columns per row)
     grid_pts = []
-    for gy in range(GRID_N):
-        for gx in range(GRID_N):
-            wx = ROOM_W * gx / (GRID_N-1)
-            wy = ROOM_H * gy / (GRID_N-1)
+    for gy in range(grid_n_y):
+        for gx in range(grid_n_x):
+            wx = ROOM_W * gx / (grid_n_x-1)
+            wy = ROOM_H * gy / (grid_n_y-1)
             grid_pts.append((wx, wy))
 
-    combined = [0.0] * (GRID_N * GRID_N)
+    combined = [0.0] * (grid_n_x * grid_n_y)
     ellipses = []
     links = []          # (tx_pos, a) per active link, for exact intersection refinement
     active_links = 0
@@ -238,10 +248,10 @@ def compute_localization(mac_covs, mac_baselines):
     blob = None
     if active_links >= 2 and max(combined) > 0.3:
         peak_idx = combined.index(max(combined))
-        gx = peak_idx % GRID_N
-        gy = peak_idx // GRID_N
-        bx = ROOM_W * gx / (GRID_N-1)
-        by = ROOM_H * gy / (GRID_N-1)
+        gx = peak_idx % grid_n_x
+        gy = peak_idx // grid_n_x
+        bx = ROOM_W * gx / (grid_n_x-1)
+        by = ROOM_H * gy / (grid_n_y-1)
         (rx_x, rx_y), rms = refine_intersection((bx, by), links, RX_POS, ROOM_W, ROOM_H)
         blob = {"x": round(rx_x,3), "y": round(rx_y,3),
                 "confidence": round(combined[peak_idx],3),
@@ -258,7 +268,8 @@ def compute_localization(mac_covs, mac_baselines):
     return {
         "room_w": ROOM_W,
         "room_h": ROOM_H,
-        "grid_n": GRID_N,
+        "grid_n_x": grid_n_x,
+        "grid_n_y": grid_n_y,
         "scores": combined,
         "blob": blob,
         "ellipses": ellipses,
