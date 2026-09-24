@@ -1,0 +1,577 @@
+#!/usr/bin/env python3
+"""
+Live CSI dashboard: UDP listener + web visualizer in one process.
+
+Protocol (binary v2, matches your ESP32 receiver):
+    'C' | ver(1) | mac[6] | rssi(i8) | noise(i8) | sig_mode(u8) | rate(u8) |
+    mcs(u8) | cwb(u8) | channel(u8) | secondary(u8) | len(u16 LE) | data[len] (i8)
+
+Scales to any number of illuminators automatically -- each source MAC
+becomes its own row in the dashboard.
+
+Usage:
+    python app.py --port 1201 --web-port 5000
+"""
+import argparse
+import json
+import os
+import socket
+import struct
+import threading
+import time
+from collections import deque, defaultdict
+
+from flask import Flask, render_template
+from flask_socketio import SocketIO
+
+HDR = 18
+WINDOW_FRAMES = 50          # ~1s at ~50Hz, per your validated motion-window size
+HEATMAP_HISTORY = 200       # columns of amplitude history kept per illuminator
+EMIT_HZ = 10                # throttle UI updates regardless of packet rate
+
+# ---------------------------------------------------------------------------
+# Room geometry  (SW corner = origin, x = East, y = North, all in metres)
+# Defaults: your 9ft x 16ft room. Updated live via set_room socket event.
+# ---------------------------------------------------------------------------
+ROOM_W = 2.743   # East-West  (9 ft)
+ROOM_H = 4.877   # North-South (16 ft)
+
+# MAC -> (x, y) for each node.  Fill in the two illuminator MACs once known;
+# until then the server falls back to "no localization" gracefully.
+# The receiver position is needed for bistatic geometry but doesn't produce CSI.
+RX_POS = (1.524, 3.048)   # 5 ft from West, 10 ft from South
+
+# Map illuminator MAC -> its (x,y) position.  These are pre-filled from your
+# measurements; you can also update them live via the "set_layout" socket event.
+NODE_POSITIONS = {
+    # "B4:3A:45:3F:A2:D0": (4.369, 0.800),   # TX1 — fill your real MACs here
+    # "FC:01:2C:2E:95:18": (0.610, 0.000),   # TX2
+}
+
+import math
+
+def _dist(a, b):
+    return math.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2)
+
+def _ellipse_points(tx, rx, n=120):
+    """
+    Return (x,y) points on the bistatic ellipse whose foci are tx and rx
+    and whose sum-of-distances equals the baseline path length d0.
+    We derive d0 from the direct TX->RX distance (line-of-sight).
+    A person perturbing the path elongates it by delta; we use delta
+    proportional to the CoV excess above baseline, scaled by a tunable
+    factor.  For visualisation we draw the base ellipse (delta=0) as a
+    thin guide and the perturbed ellipse as the presence indicator.
+    """
+    d0 = _dist(tx, rx)       # direct path = 2a minimum (person on the line)
+    cx = (tx[0]+rx[0])/2
+    cy = (tx[1]+rx[1])/2
+    angle = math.atan2(rx[1]-tx[1], rx[0]-tx[0])
+    c = d0/2                  # half focal distance
+    pts = []
+    for i in range(n+1):
+        t = 2*math.pi*i/n
+        # parametric ellipse in local frame, a=c (degenerate line at delta=0)
+        # caller passes a = c + delta/2
+        pts.append((math.cos(t), math.sin(t)))
+    return pts, cx, cy, angle, c
+
+def bistatic_ellipse(tx, rx, a):
+    """
+    Return list of (x,y) world-space points for a bistatic ellipse with
+    foci at tx, rx and semi-major axis a.
+    a must be >= dist(tx,rx)/2 = c.
+    """
+    cx = (tx[0]+rx[0])/2
+    cy = (tx[1]+rx[1])/2
+    angle = math.atan2(rx[1]-tx[1], rx[0]-tx[0])
+    c = _dist(tx, rx)/2
+    if a < c:
+        a = c + 0.01
+    b = math.sqrt(max(0, a**2 - c**2))
+    pts = []
+    n = 120
+    for i in range(n+1):
+        t = 2*math.pi*i/n
+        lx = a * math.cos(t)
+        ly = b * math.sin(t)
+        # rotate by angle
+        wx = cx + lx*math.cos(angle) - ly*math.sin(angle)
+        wy = cy + lx*math.sin(angle) + ly*math.cos(angle)
+        pts.append([round(wx,4), round(wy,4)])
+    return pts
+
+def ellipse_grid_score(tx, rx, a, grid_pts):
+    """
+    For each grid point return how close it is to the ellipse surface.
+    Score = exp(-dist_to_ellipse^2 / sigma^2), sigma ~ 0.3m.
+    """
+    sigma2 = 0.09   # 0.3m^2
+    scores = []
+    c = _dist(tx, rx)/2
+    if a < c:
+        a = c + 0.01
+    for (gx, gy) in grid_pts:
+        d_sum = _dist((gx,gy), tx) + _dist((gx,gy), rx)
+        diff = abs(d_sum - 2*a)
+        scores.append(math.exp(-diff**2/sigma2))
+    return scores
+
+def compute_localization(mac_covs, mac_baselines):
+    """
+    Given per-MAC {mac: cur_cov} and {mac: baseline_dict},
+    compute a presence heatmap over the room grid and candidate blob position.
+
+    Returns dict with keys:
+      grid_w, grid_h  -- grid dimensions
+      scores          -- flat list of floats [0,1], row-major
+      blob            -- {x,y,confidence} or None
+      ellipses        -- list of {tx, rx, pts} for drawing
+      nodes           -- list of {label, x, y, type}
+    """
+    GRID_N = 30   # 30x30 grid over the room
+
+    # build grid points
+    grid_pts = []
+    for gy in range(GRID_N):
+        for gx in range(GRID_N):
+            wx = ROOM_W * gx / (GRID_N-1)
+            wy = ROOM_H * gy / (GRID_N-1)
+            grid_pts.append((wx, wy))
+
+    combined = [0.0] * (GRID_N * GRID_N)
+    ellipses = []
+    active_links = 0
+
+    # CoV-to-path-elongation scale factor (tunable).
+    # A CoV excess of 0.1 above threshold -> ~0.5m path elongation.
+    SCALE = 5.0
+
+    for mac, tx_pos in NODE_POSITIONS.items():
+        if mac not in mac_covs:
+            continue
+        base = mac_baselines.get(mac)
+        if base is None:
+            continue
+        cur_cov = mac_covs[mac]
+        threshold = base["mean"] + 3*base["std"]
+        excess = max(0.0, cur_cov - threshold)
+
+        # semi-major axis: direct path + excess elongation
+        c = _dist(tx_pos, RX_POS)/2
+        delta = excess * SCALE
+        a = c + delta + 0.01   # +0.01 so ellipse is never degenerate
+
+        scores = ellipse_grid_score(tx_pos, RX_POS, a, grid_pts)
+        for i, s in enumerate(scores):
+            combined[i] += s
+        active_links += 1
+
+        pts = bistatic_ellipse(tx_pos, RX_POS, a)
+        ellipses.append({"tx": list(tx_pos), "rx": list(RX_POS), "pts": pts,
+                          "excess": round(excess, 4)})
+
+    # normalise
+    if active_links > 0:
+        max_s = max(combined) or 1.0
+        combined = [round(s/max_s, 4) for s in combined]
+
+    # find blob: peak of combined score
+    blob = None
+    if active_links >= 2 and max(combined) > 0.3:
+        peak_idx = combined.index(max(combined))
+        gx = peak_idx % GRID_N
+        gy = peak_idx // GRID_N
+        bx = ROOM_W * gx / (GRID_N-1)
+        by = ROOM_H * gy / (GRID_N-1)
+        blob = {"x": round(bx,3), "y": round(by,3),
+                "confidence": round(combined[peak_idx],3)}
+    elif active_links == 1 and max(combined) > 0.3:
+        # single link: show ellipse arc as blob hint, no point estimate
+        blob = None
+
+    # node list for drawing
+    nodes = [{"label": "RX", "x": round(RX_POS[0],3), "y": round(RX_POS[1],3), "type": "rx"}]
+    for mac, pos in NODE_POSITIONS.items():
+        nodes.append({"label": mac[-5:], "x": round(pos[0],3), "y": round(pos[1],3), "type": "tx"})
+
+    return {
+        "room_w": ROOM_W,
+        "room_h": ROOM_H,
+        "grid_n": GRID_N,
+        "scores": combined,
+        "blob": blob,
+        "ellipses": ellipses,
+        "nodes": nodes,
+        "active_links": active_links,
+    }
+
+app = Flask(__name__)
+app.config["SECRET_KEY"] = "csi-dashboard"
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+
+lock = threading.Lock()
+
+BASELINE_FILE = os.path.join(os.path.dirname(__file__), "baseline.json")
+LAYOUT_FILE   = os.path.join(os.path.dirname(__file__), "layout.json")
+
+def save_baseline():
+    """Write current baseline dict to JSON. Called under lock."""
+    try:
+        with open(BASELINE_FILE, "w") as f:
+            json.dump(baseline, f, indent=2)
+        print(f"[baseline] saved to {BASELINE_FILE}", flush=True)
+    except Exception as e:
+        print(f"[baseline] save failed: {e}", flush=True)
+
+def load_baseline():
+    """Load baseline from JSON on startup. Returns dict or {}."""
+    if not os.path.exists(BASELINE_FILE):
+        return {}
+    try:
+        with open(BASELINE_FILE) as f:
+            data = json.load(f)
+        print(f"[baseline] loaded {len(data)} MAC(s) from {BASELINE_FILE}", flush=True)
+        return data
+    except Exception as e:
+        print(f"[baseline] load failed: {e}", flush=True)
+        return {}
+
+def save_layout():
+    """Write NODE_POSITIONS, RX_POS and room dimensions to JSON. Called under lock."""
+    try:
+        data = {
+            "room_w": ROOM_W,
+            "room_h": ROOM_H,
+            "rx": list(RX_POS),
+            "nodes": {mac: list(pos) for mac, pos in NODE_POSITIONS.items()},
+        }
+        with open(LAYOUT_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"[layout] saved to {LAYOUT_FILE}", flush=True)
+    except Exception as e:
+        print(f"[layout] save failed: {e}", flush=True)
+
+def load_layout():
+    """Load node positions and room dimensions from JSON on startup."""
+    global RX_POS, ROOM_W, ROOM_H
+    if not os.path.exists(LAYOUT_FILE):
+        return
+    try:
+        with open(LAYOUT_FILE) as f:
+            data = json.load(f)
+        if "room_w" in data:
+            ROOM_W = float(data["room_w"])
+        if "room_h" in data:
+            ROOM_H = float(data["room_h"])
+        if "rx" in data:
+            RX_POS = tuple(data["rx"])
+        for mac, pos in data.get("nodes", {}).items():
+            NODE_POSITIONS[mac] = tuple(pos)
+        print(f"[layout] loaded room={ROOM_W}x{ROOM_H}m RX={RX_POS}, {len(NODE_POSITIONS)} TX(s) from {LAYOUT_FILE}", flush=True)
+    except Exception as e:
+        print(f"[layout] load failed: {e}", flush=True)
+
+# Per-MAC state
+amp_windows = defaultdict(lambda: deque(maxlen=WINDOW_FRAMES))       # recent amplitude vectors (non-null subcarriers)
+heatmap_hist = defaultdict(lambda: deque(maxlen=HEATMAP_HISTORY))    # recent amplitude vectors for heatmap
+cov_history = defaultdict(lambda: deque(maxlen=HEATMAP_HISTORY))     # recent CoV scalar values
+meta = {}                  # mac -> dict(rssi, noise, sig_mode, rate, mcs, cwb, channel, secondary, last_seen, pkt_count)
+baseline_capture = {"active": False, "until": 0.0, "samples": defaultdict(list)}
+
+null_mask_cache = {}       # mac -> boolean numpy-free list, True = active subcarrier
+
+baseline = load_baseline()  # persisted across restarts via baseline.json
+load_layout()               # restores RX_POS and NODE_POSITIONS from layout.json
+
+
+def iq_to_amplitude(values):
+    """
+    values: list of int8, 128 entries = 64 (imag, real) pairs.
+    Returns (amplitudes, actives) where actives marks indices that are not
+    null/guard subcarriers (i.e. not exactly (0,0)).
+    """
+    n = len(values) // 2
+    amps = [0.0] * n
+    actives = [False] * n
+    for i in range(n):
+        imag = values[2 * i]
+        real = values[2 * i + 1]
+        if imag == 0 and real == 0:
+            actives[i] = False
+            amps[i] = 0.0
+        else:
+            actives[i] = True
+            amps[i] = (real * real + imag * imag) ** 0.5
+    return amps, actives
+
+
+def compute_cov(amp_window, actives):
+    """
+    Coefficient of variation (std/mean) per active subcarrier, then averaged
+    across active subcarriers -- your validated room-independent motion signal.
+    amp_window: list of amplitude-vectors (one per frame in the sliding window)
+    """
+    if not amp_window:
+        return 0.0
+    n_sub = min(len(amp_window[0]), len(actives))
+    active_idx = [i for i in range(n_sub) if actives[i]]
+    if not active_idx:
+        return 0.0
+
+    covs = []
+    for i in active_idx:
+        series = [frame[i] for frame in amp_window]
+        m = sum(series) / len(series)
+        if m == 0:
+            continue
+        var = sum((x - m) ** 2 for x in series) / len(series)
+        std = var ** 0.5
+        covs.append(std / m)
+    if not covs:
+        return 0.0
+    return sum(covs) / len(covs)
+
+
+def udp_listener(host, port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((host, port))
+    sock.settimeout(1.0)
+    print(f"[udp] listening on {host}:{port}", flush=True)
+
+    while True:
+        try:
+            data, addr = sock.recvfrom(2048)
+        except socket.timeout:
+            continue
+
+        if len(data) < HDR or data[0:1] != b"C" or data[1] != 2:
+            continue
+
+        mac = data[2:8]
+        mac_str = ":".join(f"{b:02X}" for b in mac)
+        rssi = struct.unpack_from("b", data, 8)[0]
+        noise = struct.unpack_from("b", data, 9)[0]
+        sig_mode = data[10]
+        rate = data[11]
+        mcs = data[12]
+        cwb = data[13]
+        ch = data[14]
+        sec = data[15]
+        length = struct.unpack_from("<H", data, 16)[0]
+        payload = data[HDR:HDR + length]
+        length = len(payload)
+        values = list(struct.unpack_from(f"{length}b", payload)) if length else []
+
+        if len(values) < 4:
+            continue
+
+        amps, actives = iq_to_amplitude(values)
+
+        with lock:
+            # only append if length matches existing window to keep frames comparable
+            win = amp_windows[mac_str]
+            if win and len(win[0]) != len(amps):
+                win.clear()
+                heatmap_hist[mac_str].clear()
+            amp_windows[mac_str].append(amps)
+            heatmap_hist[mac_str].append(amps)
+            null_mask_cache[mac_str] = actives
+
+            cov = compute_cov(list(amp_windows[mac_str]), actives)
+            cov_history[mac_str].append(cov)
+
+            if baseline_capture["active"]:
+                baseline_capture["samples"][mac_str].append(cov)
+
+            now = time.time()
+            m = meta.setdefault(mac_str, {"pkt_count": 0})
+            m.update(rssi=rssi, noise=noise, sig_mode=sig_mode, rate=rate,
+                      mcs=mcs, cwb=cwb, channel=ch, secondary=sec,
+                      last_seen=now)
+            m["pkt_count"] += 1
+
+            if rate != m.get("_last_rate", rate) or sig_mode != m.get("_last_sig_mode", sig_mode):
+                print(f"[warn] {mac_str} PHY changed -- CSI not comparable across this change", flush=True)
+            m["_last_rate"] = rate
+            m["_last_sig_mode"] = sig_mode
+
+
+def emitter_loop():
+    """Push a compact snapshot to all connected clients at EMIT_HZ."""
+    period = 1.0 / EMIT_HZ
+    while True:
+        time.sleep(period)
+        with lock:
+            if not meta:
+                continue
+            payload = {}
+            mac_covs = {}
+            for mac_str, m in meta.items():
+                n_sub = len(null_mask_cache.get(mac_str, []))
+                active_idx = [i for i, a in enumerate(null_mask_cache.get(mac_str, [])) if a]
+
+                heat_rows = list(heatmap_hist[mac_str])
+                heat_active = [[row[i] for i in active_idx] for row in heat_rows]
+
+                cov_series = list(cov_history[mac_str])
+                cur_cov = cov_series[-1] if cov_series else 0.0
+                base = baseline.get(mac_str)
+                motion = None
+                if base is not None and base["mean"] is not None:
+                    threshold = base["mean"] + 3 * base["std"]
+                    motion = cur_cov > threshold
+
+                mac_covs[mac_str] = cur_cov
+                payload[mac_str] = {
+                    "rssi": m.get("rssi"),
+                    "noise": m.get("noise"),
+                    "sig_mode": m.get("sig_mode"),
+                    "rate": m.get("rate"),
+                    "channel": m.get("channel"),
+                    "pkt_count": m.get("pkt_count"),
+                    "n_active_subcarriers": len(active_idx),
+                    "n_total_subcarriers": n_sub,
+                    "cov_series": cov_series,
+                    "cur_cov": cur_cov,
+                    "heatmap": heat_active,
+                    "baseline": base,
+                    "motion": motion,
+                }
+
+            loc = compute_localization(mac_covs, baseline)
+            socketio.emit("csi_update", payload)
+            socketio.emit("localization", loc)
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@socketio.on("connect")
+def handle_connect():
+    """Send persisted layout and baseline status to a newly connected client."""
+    with lock:
+        socketio.emit("layout_ack", {
+            "room_w": ROOM_W, "room_h": ROOM_H,
+            "node_positions": {k: list(v) for k, v in NODE_POSITIONS.items()},
+            "rx_pos": list(RX_POS),
+        })
+        if baseline:
+            socketio.emit("baseline_status", {"phase": "done", "baseline": baseline})
+
+
+@socketio.on("start_baseline")
+def handle_start_baseline(data):
+    duration = float(data.get("duration", 8))
+    delay = float(data.get("delay", 30))
+
+    socketio.emit("baseline_status", {"phase": "countdown", "delay": delay, "duration": duration})
+
+    def run():
+        # Grace period so the user can leave the room before recording starts.
+        remaining = delay
+        while remaining > 0:
+            step = min(1.0, remaining)
+            time.sleep(step)
+            remaining -= step
+            socketio.emit("baseline_countdown_tick", {"remaining": round(remaining, 1)})
+
+        with lock:
+            baseline_capture["active"] = True
+            baseline_capture["until"] = time.time() + duration
+            baseline_capture["samples"] = defaultdict(list)
+        socketio.emit("baseline_status", {"phase": "capturing", "duration": duration})
+
+        time.sleep(duration)
+
+        with lock:
+            baseline_capture["active"] = False
+            for mac_str, samples in baseline_capture["samples"].items():
+                if len(samples) >= 3:
+                    m = sum(samples) / len(samples)
+                    var = sum((x - m) ** 2 for x in samples) / len(samples)
+                    std = var ** 0.5
+                    baseline[mac_str] = {"mean": m, "std": std, "n": len(samples)}
+            save_baseline()
+        socketio.emit("baseline_status", {"phase": "done", "baseline": baseline})
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+@socketio.on("set_room")
+def handle_set_room(data):
+    global ROOM_W, ROOM_H
+    with lock:
+        ROOM_W = float(data.get("w", ROOM_W))
+        ROOM_H = float(data.get("h", ROOM_H))
+        save_layout()
+    socketio.emit("layout_ack", {
+        "room_w": ROOM_W, "room_h": ROOM_H,
+        "node_positions": {k: list(v) for k, v in NODE_POSITIONS.items()},
+        "rx_pos": list(RX_POS),
+    })
+
+
+@socketio.on("set_layout")
+def handle_set_layout(data):
+    """
+    data: { mac: "AA:BB:CC:DD:EE:FF", x: 1.2, y: 3.4 }
+    or    { rx: true, x: 1.2, y: 3.4 }
+    Lets the UI update node positions without restarting the server.
+    """
+    global RX_POS
+    with lock:
+        if data.get("rx"):
+            RX_POS = (float(data["x"]), float(data["y"]))
+        elif "mac" in data:
+            NODE_POSITIONS[data["mac"]] = (float(data["x"]), float(data["y"]))
+        save_layout()
+    socketio.emit("layout_ack", {
+        "room_w": ROOM_W, "room_h": ROOM_H,
+        "node_positions": {k: list(v) for k,v in NODE_POSITIONS.items()},
+        "rx_pos": list(RX_POS),
+    })
+
+
+@socketio.on("remove_node")
+def handle_remove_node(data):
+    with lock:
+        NODE_POSITIONS.pop(data.get("mac", ""), None)
+        save_layout()
+    socketio.emit("layout_ack", {
+        "room_w": ROOM_W, "room_h": ROOM_H,
+        "node_positions": {k: list(v) for k,v in NODE_POSITIONS.items()},
+        "rx_pos": list(RX_POS),
+    })
+
+
+@socketio.on("clear_baseline")
+def handle_clear_baseline():
+    with lock:
+        baseline.clear()
+        save_baseline()
+    socketio.emit("baseline_status", {"phase": "cleared", "baseline": {}})
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--port", type=int, default=1201, help="UDP port (CONTROLLER_PORT)")
+    ap.add_argument("--web-host", default="0.0.0.0")
+    ap.add_argument("--web-port", type=int, default=5000)
+    args = ap.parse_args()
+
+    t = threading.Thread(target=udp_listener, args=(args.host, args.port), daemon=True)
+    t.start()
+
+    e = threading.Thread(target=emitter_loop, daemon=True)
+    e.start()
+
+    print(f"[web] dashboard at http://{args.web_host}:{args.web_port}", flush=True)
+    socketio.run(app, host=args.web_host, port=args.web_port, allow_unsafe_werkzeug=True)
+
+
+if __name__ == "__main__":
+    main()

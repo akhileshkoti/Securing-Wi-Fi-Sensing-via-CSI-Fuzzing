@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>CSI Sensing Dashboard</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+    <style>
+        :root {
+            --bg: #0b0d12;
+            --panel: #11141b;
+            --panel-border: #1f2430;
+            --text: #e6e8ec;
+            --muted: #8b93a3;
+            --accent: #5ec6ff;
+            --warn: #ff6b6b;
+            --ok: #4ade80;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            background: var(--bg);
+            color: var(--text);
+            font-family: 'SF Mono', 'Consolas', 'Monaco', monospace;
+            font-size: 13px;
+        }
+
+        header {
+            padding: 16px 24px;
+            border-bottom: 1px solid var(--panel-border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+
+        h1 {
+            font-size: 16px;
+            margin: 0;
+            font-weight: 600;
+            letter-spacing: 0.5px;
+            color: var(--accent);
+        }
+
+        .controls {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+
+        button {
+            background: var(--panel);
+            border: 1px solid var(--panel-border);
+            color: var(--text);
+            padding: 6px 14px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 12px;
+        }
+
+        button:hover {
+            border-color: var(--accent);
+        }
+
+        button.primary {
+            background: var(--accent);
+            color: #04101a;
+            border-color: var(--accent);
+        }
+
+        button.danger:hover {
+            border-color: var(--warn);
+        }
+
+        input[type=number] {
+            width: 50px;
+            background: var(--panel);
+            border: 1px solid var(--panel-border);
+            color: var(--text);
+            border-radius: 4px;
+            padding: 4px 6px;
+            font-family: inherit;
+        }
+
+        #status {
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        #grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+            gap: 16px;
+            padding: 20px;
+        }
+
+        .card {
+            background: var(--panel);
+            border: 1px solid var(--panel-border);
+            border-radius: 10px;
+            padding: 14px 16px;
+        }
+
+        .card-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            margin-bottom: 8px;
+        }
+
+        .mac {
+            color: var(--accent);
+            font-weight: 600;
+        }
+
+        .pill {
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 10px;
+            background: #1c2230;
+            color: var(--muted);
+        }
+
+        .pill.motion {
+            background: var(--warn);
+            color: #1a0505;
+        }
+
+        .pill.still {
+            background: #1c2230;
+            color: var(--ok);
+        }
+
+        .meta-row {
+            color: var(--muted);
+            font-size: 11px;
+            margin-bottom: 10px;
+            display: flex;
+            gap: 14px;
+            flex-wrap: wrap;
+        }
+
+        canvas.heatmap {
+            width: 100%;
+            height: 100px;
+            image-rendering: pixelated;
+            border-radius: 4px;
+            display: block;
+            margin-bottom: 10px;
+        }
+
+        .chart-wrap {
+            height: 120px;
+        }
+
+        #room-panel {
+            margin: 0 20px 20px 20px;
+            background: var(--panel);
+            border: 1px solid var(--panel-border);
+            border-radius: 10px;
+            padding: 16px;
+        }
+
+        #room-panel h2 {
+            font-size: 12px;
+            color: var(--muted);
+            margin: 0 0 12px 0;
+            font-weight: 400;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+        }
+
+        #room-wrap {
+            display: flex;
+            gap: 20px;
+            align-items: flex-start;
+            flex-wrap: wrap;
+        }
+
+        #room-canvas-wrap {
+            position: relative;
+            flex-shrink: 0;
+        }
+
+        #room-canvas {
+            display: block;
+            border: 1px solid var(--panel-border);
+            border-radius: 4px;
+        }
+
+        #layout-form {
+            font-size: 11px;
+            color: var(--muted);
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            min-width: 220px;
+        }
+
+        #layout-form label {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        #layout-form input[type=text] {
+            background: var(--bg);
+            border: 1px solid var(--panel-border);
+            color: var(--text);
+            border-radius: 4px;
+            padding: 4px 6px;
+            font-family: inherit;
+            font-size: 11px;
+            width: 100%;
+        }
+
+        #layout-form .row {
+            display: flex;
+            gap: 6px;
+        }
+
+        #layout-form .row input[type=number] {
+            width: 60px;
+        }
+
+        #loc-status {
+            font-size: 11px;
+            color: var(--muted);
+            margin-top: 4px;
+        }
+    </style>
+</head>
+
+<body>
+
+    <header>
+        <h1>CSI SENSING &mdash; LIVE</h1>
+        <div class="controls">
+            <span id="status">connecting...</span>
+            <span style="color:var(--panel-border)">|</span>
+            <label style="color:var(--muted)">leave-room delay (s): <input type="number" id="baselineDelay" value="30"
+                    min="0" max="120"></label>
+            <label style="color:var(--muted)">duration (s): <input type="number" id="baselineDur" value="8" min="2"
+                    max="60"></label>
+            <button class="primary" id="btnBaseline">Capture baseline (empty room)</button>
+            <button class="danger" id="btnClear">Clear baseline</button>
+        </div>
+    </header>
+
+    <div id="room-panel">
+        <h2>Room — Presence Localization</h2>
+        <div id="room-wrap">
+            <div id="room-canvas-wrap">
+                <canvas id="room-canvas" width="300" height="533"></canvas>
+            </div>
+            <div id="layout-form">
+                <div style="color:var(--accent); margin-bottom:8px; font-size:12px;">Node positions</div>
+
+                <div style="color:var(--muted); margin-bottom:4px;">Room dimensions</div>
+                <div class="row" style="margin-bottom:10px;">
+                    <label>W/E-W (m)<input type="number" id="room-w" step="0.01" value="2.743"></label>
+                    <label>H/N-S (m)<input type="number" id="room-h" step="0.01" value="4.877"></label>
+                    <button onclick="setRoom()">Set</button>
+                </div>
+
+                <div id="tx-list"></div>
+                <button onclick="addTxRow()" style="width:100%; margin-bottom:10px;">+ Add TX</button>
+
+                <div style="color:var(--muted); margin-bottom:4px;">RX (receiver)</div>
+                <div class="row">
+                    <label>x (m)<input type="number" id="rx-x" step="0.01" value="1.524"></label>
+                    <label>y (m)<input type="number" id="rx-y" step="0.01" value="3.048"></label>
+                    <button onclick="setRx()">Set RX</button>
+                </div>
+                <div id="loc-status" style="margin-top:6px;">Assign MACs to TX positions to enable localization</div>
+            </div>
+        </div>
+    </div>
+
+    <div id="grid"></div>
+    <div id="empty">Waiting for packets... (run the ESP32 receiver pointed at this machine)</div>
+
+    <script>
+        const socket = io();
+        const cards = {};       // mac -> {el, heatCanvas, chart}
+        const grid = document.getElementById('grid');
+        const emptyMsg = document.getElementById('empty');
+        const statusEl = document.getElementById('status');
+
+        socket.on('connect', () => { statusEl.textContent = 'connected'; });
+        socket.on('disconnect', () => { statusEl.textContent = 'disconnected'; });
+
+        document.getElementById('btnBaseline').onclick = () => {
+            const dur = parseFloat(document.getElementById('baselineDur').value) || 8;
+            const delay = parseFloat(document.getElementById('baselineDelay').value) || 30;
+            socket.emit('start_baseline', { duration: dur, delay: delay });
+        };
+        document.getElementById('btnClear').onclick = () => {
+            socket.emit('clear_baseline');
+        };
+        socket.on('baseline_countdown_tick', (s) => {
+            statusEl.textContent = `leave the room... starting in ${s.remaining}s`;
+        });
+        socket.on('baseline_status', (s) => {
+            if (s.phase === 'countdown') {
+                statusEl.textContent = `leave the room... starting in ${s.delay}s`;
+            } else if (s.phase === 'capturing') {
+                statusEl.textContent = `capturing baseline, keep room empty (${s.duration}s)`;
+            } else if (s.phase === 'done') {
+                statusEl.textContent = 'baseline captured — connected';
+            } else if (s.phase === 'cleared') {
+                statusEl.textContent = 'baseline cleared — connected';
+            }
+        });
+
+        function colorForAmp(v, maxAmp) {
+            // simple blue->yellow->red ramp
+            const t = Math.max(0, Math.min(1, v / maxAmp));
+            const r = Math.round(255 * Math.min(1, t * 2));
+            const g = Math.round(255 * Math.min(1, (1 - Math.abs(t - 0.5) * 2)));
+            const b = Math.round(255 * Math.min(1, (1 - t) * 2));
+            return `rgb(${r},${g},${b})`;
+        }
+
+        function makeCard(mac) {
+            const el = document.createElement('div');
+            el.className = 'card';
+            el.innerHTML = `
+    <div class="card-head">
+      <span class="mac">${mac}</span>
+      <span class="pill" id="pill-${mac}">--</span>
+    </div>
+    <div class="meta-row" id="meta-${mac}"></div>
+    <canvas class="heatmap" id="heat-${mac}" width="200" height="100"></canvas>
+    <div class="chart-wrap"><canvas id="chart-${mac}"></canvas></div>
+  `;
+            grid.appendChild(el);
+
+            const ctx = document.getElementById(`chart-${mac}`).getContext('2d');
+            const chart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [
+                        {
+                            label: 'CoV (motion score)',
+                            data: [],
+                            borderColor: '#5ec6ff',
+                            borderWidth: 1.5,
+                            pointRadius: 0,
+                            tension: 0.2,
+                        },
+                        {
+                            label: 'baseline threshold',
+                            data: [],
+                            borderColor: '#ff6b6b',
+                            borderWidth: 1,
+                            borderDash: [4, 4],
+                            pointRadius: 0,
+                        }
+                    ]
+                },
+                options: {
+                    animation: false,
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        x: { display: false },
+                        y: { ticks: { color: '#8b93a3', font: { size: 9 } }, grid: { color: '#1f2430' } }
+                    },
+                    plugins: { legend: { labels: { color: '#8b93a3', font: { size: 10 } } } }
+                }
+            });
+
+            return { el, chart, heatCanvas: document.getElementById(`heat-${mac}`) };
+        }
+
+        function drawHeatmap(canvas, heatmap) {
+            if (!heatmap || heatmap.length === 0) return;
+            const nCols = heatmap.length;
+            const nRows = heatmap[0].length;
+            canvas.width = nCols;
+            canvas.height = nRows;
+            const ctx = canvas.getContext('2d');
+            const img = ctx.createImageData(nCols, nRows);
+
+            let maxAmp = 1;
+            for (const row of heatmap) for (const v of row) if (v > maxAmp) maxAmp = v;
+
+            for (let c = 0; c < nCols; c++) {
+                const row = heatmap[c];
+                for (let r = 0; r < nRows; r++) {
+                    const v = row[r];
+                    const color = colorForAmp(v, maxAmp);
+                    const [rr, gg, bb] = color.match(/\d+/g).map(Number);
+                    // flip row so subcarrier 0 is at bottom
+                    const idx = ((nRows - 1 - r) * nCols + c) * 4;
+                    img.data[idx] = rr;
+                    img.data[idx + 1] = gg;
+                    img.data[idx + 2] = bb;
+                    img.data[idx + 3] = 255;
+                }
+            }
+            ctx.putImageData(img, 0, 0);
+        }
+
+        socket.on('csi_update', (payload) => {
+            const macs = Object.keys(payload);
+            if (macs.length === 0) return;
+            emptyMsg.style.display = 'none';
+
+            for (const mac of macs) {
+                if (!cards[mac]) cards[mac] = makeCard(mac);
+                const c = cards[mac];
+                const d = payload[mac];
+
+                document.getElementById(`meta-${mac}`).innerHTML = `
+      <span>rssi ${d.rssi}dB</span>
+      <span>noise ${d.noise}dB</span>
+      <span>ch ${d.channel}</span>
+      <span>sig_mode ${d.sig_mode}</span>
+      <span>rate ${d.rate}</span>
+      <span>active subcarriers ${d.n_active_subcarriers}/${d.n_total_subcarriers}</span>
+      <span>pkts ${d.pkt_count}</span>
+    `;
+
+                const pill = document.getElementById(`pill-${mac}`);
+                if (d.baseline) {
+                    if (d.motion) {
+                        pill.textContent = 'MOTION';
+                        pill.className = 'pill motion';
+                    } else {
+                        pill.textContent = 'still';
+                        pill.className = 'pill still';
+                    }
+                } else {
+                    pill.textContent = 'no baseline';
+                    pill.className = 'pill';
+                }
+
+                // update chart
+                const series = d.cov_series;
+                c.chart.data.labels = series.map((_, i) => i);
+                c.chart.data.datasets[0].data = series;
+                if (d.baseline) {
+                    const threshold = d.baseline.mean + 3 * d.baseline.std;
+                    c.chart.data.datasets[1].data = series.map(() => threshold);
+                } else {
+                    c.chart.data.datasets[1].data = [];
+                }
+                c.chart.update();
+
+                drawHeatmap(c.heatCanvas, d.heatmap);
+            }
+        });
+
+        // ── Room Visualization ──────────────────────────────────────────────────────
+        const roomCanvas = document.getElementById('room-canvas');
+        const roomCtx = roomCanvas.getContext('2d');
+        const locStatus = document.getElementById('loc-status');
+
+        // Room real dimensions (metres) — kept in sync with server via layout_ack
+        let roomW = 2.743, roomH = 4.877;
+        const CANVAS_W = 300, CANVAS_H = 533;
+
+        function toCanvas(x, y) {
+            // world (x=east, y=north) -> canvas (origin top-left, y flipped)
+            return [
+                Math.round(x / roomW * CANVAS_W),
+                Math.round((1 - y / roomH) * CANVAS_H)
+            ];
+        }
+
+        function drawRoom(loc) {
+            roomCtx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+
+            // background
+            roomCtx.fillStyle = '#0b0d12';
+            roomCtx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+            // presence heatmap grid
+            if (loc && loc.scores && loc.scores.length > 0) {
+                const n = loc.grid_n;
+                const cellW = CANVAS_W / n;
+                const cellH = CANVAS_H / n;
+                for (let gy = 0; gy < n; gy++) {
+                    for (let gx = 0; gx < n; gx++) {
+                        const score = loc.scores[gy * n + gx];
+                        if (score < 0.05) continue;
+                        const alpha = score * 0.7;
+                        // blue->cyan->yellow based on score
+                        const r = Math.round(255 * Math.min(1, score * 2));
+                        const g = Math.round(180 * score);
+                        const b = Math.round(255 * (1 - score));
+                        roomCtx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
+                        // canvas y is flipped relative to world y
+                        const cx = gx * cellW;
+                        const cy = (n - 1 - gy) * cellH;
+                        roomCtx.fillRect(cx, cy, cellW + 1, cellH + 1);
+                    }
+                }
+            }
+
+            // room outline
+            roomCtx.strokeStyle = '#1f2430';
+            roomCtx.lineWidth = 2;
+            roomCtx.strokeRect(1, 1, CANVAS_W - 2, CANVAS_H - 2);
+
+            // bistatic ellipses
+            if (loc && loc.ellipses) {
+                for (const ell of loc.ellipses) {
+                    if (!ell.pts || ell.pts.length < 2) continue;
+                    roomCtx.beginPath();
+                    const [sx, sy] = toCanvas(ell.pts[0][0], ell.pts[0][1]);
+                    roomCtx.moveTo(sx, sy);
+                    for (let i = 1; i < ell.pts.length; i++) {
+                        const [px, py] = toCanvas(ell.pts[i][0], ell.pts[i][1]);
+                        roomCtx.lineTo(px, py);
+                    }
+                    roomCtx.closePath();
+                    roomCtx.strokeStyle = ell.excess > 0 ? 'rgba(255,107,107,0.5)' : 'rgba(94,198,255,0.2)';
+                    roomCtx.lineWidth = ell.excess > 0 ? 1.5 : 0.5;
+                    roomCtx.stroke();
+                }
+            }
+
+            // blob — presence dot
+            if (loc && loc.blob) {
+                const [bx, by] = toCanvas(loc.blob.x, loc.blob.y);
+                const conf = loc.blob.confidence;
+                const radius = 8 + conf * 14;
+                // glow
+                const grad = roomCtx.createRadialGradient(bx, by, 0, bx, by, radius * 2);
+                grad.addColorStop(0, `rgba(255,200,50,${conf * 0.9})`);
+                grad.addColorStop(0.4, `rgba(255,100,50,${conf * 0.5})`);
+                grad.addColorStop(1, 'rgba(255,100,50,0)');
+                roomCtx.beginPath();
+                roomCtx.arc(bx, by, radius * 2, 0, Math.PI * 2);
+                roomCtx.fillStyle = grad;
+                roomCtx.fill();
+                // core dot
+                roomCtx.beginPath();
+                roomCtx.arc(bx, by, radius, 0, Math.PI * 2);
+                roomCtx.fillStyle = `rgba(255,210,60,${0.7 + conf * 0.3})`;
+                roomCtx.fill();
+            }
+
+            // nodes
+            if (loc && loc.nodes) {
+                for (const node of loc.nodes) {
+                    const [nx, ny] = toCanvas(node.x, node.y);
+                    roomCtx.beginPath();
+                    if (node.type === 'rx') {
+                        // diamond for RX
+                        roomCtx.moveTo(nx, ny - 8);
+                        roomCtx.lineTo(nx + 7, ny);
+                        roomCtx.lineTo(nx, ny + 8);
+                        roomCtx.lineTo(nx - 7, ny);
+                        roomCtx.closePath();
+                        roomCtx.fillStyle = '#4ade80';
+                        roomCtx.fill();
+                    } else {
+                        // circle for TX
+                        roomCtx.arc(nx, ny, 7, 0, Math.PI * 2);
+                        roomCtx.fillStyle = '#5ec6ff';
+                        roomCtx.fill();
+                    }
+                    roomCtx.fillStyle = '#e6e8ec';
+                    roomCtx.font = '10px monospace';
+                    roomCtx.fillText(node.label, nx + 9, ny + 4);
+                }
+            }
+
+            // compass / scale
+            roomCtx.fillStyle = '#8b93a3';
+            roomCtx.font = '9px monospace';
+            roomCtx.fillText('N', CANVAS_W / 2 - 3, 12);
+            roomCtx.fillText('S', CANVAS_W / 2 - 3, CANVAS_H - 4);
+            roomCtx.fillText(`${roomH.toFixed(1)}m`, 4, CANVAS_H / 2);
+
+            // localization status
+            if (loc) {
+                if (loc.active_links === 0) {
+                    locStatus.textContent = 'Assign TX MACs to enable localization';
+                } else if (loc.active_links === 1) {
+                    locStatus.textContent = `1 link active — ellipse shown, need 2 links for position estimate`;
+                } else if (!loc.blob) {
+                    locStatus.textContent = `${loc.active_links} links active — no motion above threshold`;
+                } else {
+                    locStatus.textContent = `Position estimate: (${loc.blob.x.toFixed(2)}m E, ${loc.blob.y.toFixed(2)}m N)  confidence ${(loc.blob.confidence * 100).toFixed(0)}%`;
+                }
+            }
+        }
+
+        socket.on('localization', (loc) => {
+            roomW = loc.room_w;
+            roomH = loc.room_h;
+            drawRoom(loc);
+        });
+
+        socket.on('layout_ack', (data) => {
+            if (data.room_w) document.getElementById('room-w').value = data.room_w;
+            if (data.room_h) document.getElementById('room-h').value = data.room_h;
+            if (data.rx_pos) {
+                document.getElementById('rx-x').value = data.rx_pos[0];
+                document.getElementById('rx-y').value = data.rx_pos[1];
+            }
+            if (data.node_positions) {
+                const list = document.getElementById('tx-list');
+                list.innerHTML = '';
+                txRowCount = 0;
+                for (const [mac, pos] of Object.entries(data.node_positions)) {
+                    addTxRow(mac, pos[0], pos[1]);
+                }
+            }
+        });
+
+        // ── Dynamic TX node rows ────────────────────────────────────────────────────
+        let txRowCount = 0;
+
+        function addTxRow(mac = '', x = '', y = '') {
+            txRowCount++;
+            const id = txRowCount;
+            const list = document.getElementById('tx-list');
+            const wrap = document.createElement('div');
+            wrap.id = `tx-row-${id}`;
+            wrap.style.cssText = 'border:1px solid var(--panel-border);border-radius:6px;padding:8px;margin-bottom:8px;';
+            wrap.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+      <span style="color:var(--accent);font-size:11px;">TX${id}</span>
+      <button onclick="removeTxRow(${id})" style="padding:2px 8px;font-size:10px;" title="Remove">✕</button>
+    </div>
+    <label style="display:flex;flex-direction:column;gap:2px;margin-bottom:4px;">MAC
+      <input type="text" id="tx-mac-${id}" value="${mac}" placeholder="AA:BB:CC:DD:EE:FF"
+             style="background:var(--bg);border:1px solid var(--panel-border);color:var(--text);border-radius:4px;padding:4px 6px;font-family:inherit;font-size:11px;width:100%;">
+    </label>
+    <div style="display:flex;gap:6px;align-items:flex-end;">
+      <label style="display:flex;flex-direction:column;gap:2px;font-size:11px;">x (m)
+        <input type="number" id="tx-x-${id}" step="0.01" value="${x}"
+               style="width:60px;background:var(--panel);border:1px solid var(--panel-border);color:var(--text);border-radius:4px;padding:4px 6px;font-family:inherit;">
+      </label>
+      <label style="display:flex;flex-direction:column;gap:2px;font-size:11px;">y (m)
+        <input type="number" id="tx-y-${id}" step="0.01" value="${y}"
+               style="width:60px;background:var(--panel);border:1px solid var(--panel-border);color:var(--text);border-radius:4px;padding:4px 6px;font-family:inherit;">
+      </label>
+      <button onclick="setTxRow(${id})" style="padding:4px 10px;font-size:11px;">Set</button>
+    </div>
+  `;
+            list.appendChild(wrap);
+        }
+
+        function removeTxRow(id) {
+            const mac = document.getElementById(`tx-mac-${id}`).value.trim().toUpperCase();
+            document.getElementById(`tx-row-${id}`).remove();
+            if (mac) socket.emit('remove_node', { mac });
+        }
+
+        function setTxRow(id) {
+            const mac = document.getElementById(`tx-mac-${id}`).value.trim().toUpperCase();
+            const x = parseFloat(document.getElementById(`tx-x-${id}`).value);
+            const y = parseFloat(document.getElementById(`tx-y-${id}`).value);
+            if (!mac) { alert('Enter the MAC address first'); return; }
+            if (isNaN(x) || isNaN(y)) { alert('Enter valid x and y coordinates'); return; }
+            socket.emit('set_layout', { mac, x, y });
+        }
+
+        function setRoom() {
+            const w = parseFloat(document.getElementById('room-w').value);
+            const h = parseFloat(document.getElementById('room-h').value);
+            if (isNaN(w) || isNaN(h) || w <= 0 || h <= 0) { alert('Enter valid room dimensions'); return; }
+            socket.emit('set_room', { w, h });
+        }
+
+        function setRx() {
+            const x = parseFloat(document.getElementById('rx-x').value);
+            const y = parseFloat(document.getElementById('rx-y').value);
+            socket.emit('set_layout', { rx: true, x, y });
+        }
+
+        // draw empty room on load
+        addTxRow();   // start with one empty TX row
+        drawRoom(null);
+    </script>
+</body>
+
+</html>
