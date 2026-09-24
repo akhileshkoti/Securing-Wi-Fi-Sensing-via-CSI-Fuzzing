@@ -9,11 +9,38 @@
 namespace {
   volatile uint32_t s_espnowRx = 0;   // ESP-NOW frames received
 
-  // Accept the Illuminators' ESP-NOW frames so the stack processes them.
-  // CSI is captured separately by the PHY; this just keeps ESP-NOW alive.
+  // Illuminator MACs learned from their "ILU,<id>,<seq>" beacon payload
+  // (EspNowBeacon.cpp). onCsi() only forwards frames from these sources --
+  // otherwise the CSI callback fires for *any* frame the radio receives on
+  // this channel (AP traffic, neighboring devices, etc.), which pollutes
+  // the sensing pipeline with sources that were never part of the geometry.
+  constexpr uint8_t kMaxIlluminators = 8;
+  uint8_t s_illuminatorMacs[kMaxIlluminators][6];
+  uint8_t s_illuminatorCount = 0;
+
+  bool isKnownIlluminator(const uint8_t *mac) {
+    for (uint8_t i = 0; i < s_illuminatorCount; i++) {
+      if (memcmp(s_illuminatorMacs[i], mac, 6) == 0) return true;
+    }
+    return false;
+  }
+
+  void registerIlluminator(const uint8_t *mac) {
+    if (isKnownIlluminator(mac)) return;
+    if (s_illuminatorCount >= kMaxIlluminators) return;
+    memcpy(s_illuminatorMacs[s_illuminatorCount], mac, 6);
+    s_illuminatorCount++;
+    Serial.printf("[CSI] registered illuminator %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  }
+
+  // Accept the Illuminators' ESP-NOW frames so the stack processes them,
+  // and learn their MACs so onCsi() can scope capture to known sources.
   void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
-    (void)mac; (void)data; (void)len;
     s_espnowRx++;
+    if (len >= 4 && memcmp(data, "ILU,", 4) == 0) {
+      registerIlluminator(mac);
+    }
   }
 
   struct CsiRecord {
@@ -36,6 +63,7 @@ namespace {
   // Wi-Fi task context: keep minimal, just copy + enqueue.
   void onCsi(void *ctx, wifi_csi_info_t *info) {
     if (!s_queue || !info || !info->buf || info->len == 0) return;
+    if (!isKnownIlluminator(info->mac)) return;   // not one of our illuminators
     s_csiCount++;
     const wifi_pkt_rx_ctrl_t &rx = info->rx_ctrl;
     CsiRecord r;

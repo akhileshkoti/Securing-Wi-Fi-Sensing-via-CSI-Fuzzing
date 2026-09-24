@@ -4,3 +4,5 @@
 .vscode/launch.json
 .vscode/ipch
 controller/csi_logs/
+__pycache__/
+*.pyc

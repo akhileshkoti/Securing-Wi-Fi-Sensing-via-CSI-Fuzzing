@@ -48,6 +48,15 @@ NODE_POSITIONS = {
     # "FC:01:2C:2E:95:18": (0.610, 0.000),   # TX2
 }
 
+# CoV-excess -> path-elongation (metres) scale factor. This links a
+# dimensionless motion statistic to physical RF path perturbation, which
+# depends on propagation physics (wavelength, reflection strength) and can't
+# be derived from node geometry alone -- it must be measured (see
+# "calibrate_scale" socket event) by standing at a known point and comparing
+# the true geometric elongation to the observed CoV excess. Persisted to
+# calibration.json; this is only the fallback before any measurement exists.
+ELONGATION_SCALE = 5.0
+
 import math
 
 def _dist(a, b):
@@ -117,6 +126,47 @@ def ellipse_grid_score(tx, rx, a, grid_pts):
         scores.append(math.exp(-diff**2/sigma2))
     return scores
 
+def refine_intersection(p0, links, rx, room_w, room_h, iters=150):
+    """
+    The grid heatmap's arg-max is a coarse (room_w/(GRID_N-1) cell size)
+    score peak, not the actual ellipse intersection -- it never solves the
+    "two links, one point" geometry the localization is supposed to be
+    doing. This refines p0 via gradient descent on the sum of squared
+    ellipse-equation residuals (dist(tx,p)+dist(p,rx) - 2a) across all
+    active links, giving a genuine joint intersection estimate. With >=3
+    links this also resolves the two-ellipse mirror ambiguity, since only
+    one point can satisfy every link's equation at once.
+    Returns (x, y), rms_residual_m.
+    """
+    def cost(p):
+        total = 0.0
+        for tx, a in links:
+            r = (_dist(p, tx) + _dist(p, rx)) - 2 * a
+            total += r * r
+        return total
+
+    x, y = p0
+    h = 1e-4
+    step = 0.2  # metres, shrinks on stall
+    c0 = cost((x, y))
+    for _ in range(iters):
+        gx = (cost((x + h, y)) - c0) / h
+        gy = (cost((x, y + h)) - c0) / h
+        glen = math.hypot(gx, gy)
+        if glen < 1e-9:
+            break
+        nx = min(max(x - step * gx / glen, 0.0), room_w)
+        ny = min(max(y - step * gy / glen, 0.0), room_h)
+        c1 = cost((nx, ny))
+        if c1 < c0:
+            x, y, c0 = nx, ny, c1
+        else:
+            step *= 0.5
+            if step < 1e-4:
+                break
+    return (x, y), math.sqrt(c0 / max(1, len(links)))
+
+
 def compute_localization(mac_covs, mac_baselines):
     """
     Given per-MAC {mac: cur_cov} and {mac: baseline_dict},
@@ -141,11 +191,8 @@ def compute_localization(mac_covs, mac_baselines):
 
     combined = [0.0] * (GRID_N * GRID_N)
     ellipses = []
+    links = []          # (tx_pos, a) per active link, for exact intersection refinement
     active_links = 0
-
-    # CoV-to-path-elongation scale factor (tunable).
-    # A CoV excess of 0.1 above threshold -> ~0.5m path elongation.
-    SCALE = 5.0
 
     for mac, tx_pos in NODE_POSITIONS.items():
         if mac not in mac_covs:
@@ -159,13 +206,14 @@ def compute_localization(mac_covs, mac_baselines):
 
         # semi-major axis: direct path + excess elongation
         c = _dist(tx_pos, RX_POS)/2
-        delta = excess * SCALE
+        delta = excess * ELONGATION_SCALE
         a = c + delta + 0.01   # +0.01 so ellipse is never degenerate
 
         scores = ellipse_grid_score(tx_pos, RX_POS, a, grid_pts)
         for i, s in enumerate(scores):
             combined[i] += s
         active_links += 1
+        links.append((tx_pos, a))
 
         pts = bistatic_ellipse(tx_pos, RX_POS, a)
         ellipses.append({"tx": list(tx_pos), "rx": list(RX_POS), "pts": pts,
@@ -176,7 +224,7 @@ def compute_localization(mac_covs, mac_baselines):
         max_s = max(combined) or 1.0
         combined = [round(s/max_s, 4) for s in combined]
 
-    # find blob: peak of combined score
+    # find blob: coarse grid peak, refined to the actual ellipse intersection
     blob = None
     if active_links >= 2 and max(combined) > 0.3:
         peak_idx = combined.index(max(combined))
@@ -184,8 +232,10 @@ def compute_localization(mac_covs, mac_baselines):
         gy = peak_idx // GRID_N
         bx = ROOM_W * gx / (GRID_N-1)
         by = ROOM_H * gy / (GRID_N-1)
-        blob = {"x": round(bx,3), "y": round(by,3),
-                "confidence": round(combined[peak_idx],3)}
+        (rx_x, rx_y), rms = refine_intersection((bx, by), links, RX_POS, ROOM_W, ROOM_H)
+        blob = {"x": round(rx_x,3), "y": round(rx_y,3),
+                "confidence": round(combined[peak_idx],3),
+                "residual_m": round(rms,4)}
     elif active_links == 1 and max(combined) > 0.3:
         # single link: show ellipse arc as blob hint, no point estimate
         blob = None
@@ -212,8 +262,9 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 lock = threading.Lock()
 
-BASELINE_FILE = os.path.join(os.path.dirname(__file__), "baseline.json")
-LAYOUT_FILE   = os.path.join(os.path.dirname(__file__), "layout.json")
+BASELINE_FILE    = os.path.join(os.path.dirname(__file__), "baseline.json")
+LAYOUT_FILE      = os.path.join(os.path.dirname(__file__), "layout.json")
+CALIBRATION_FILE = os.path.join(os.path.dirname(__file__), "calibration.json")
 
 def save_baseline():
     """Write current baseline dict to JSON. Called under lock."""
@@ -267,10 +318,35 @@ def load_layout():
         if "rx" in data:
             RX_POS = tuple(data["rx"])
         for mac, pos in data.get("nodes", {}).items():
-            NODE_POSITIONS[mac] = tuple(pos)
+            NODE_POSITIONS[mac.strip().upper()] = tuple(pos)
         print(f"[layout] loaded room={ROOM_W}x{ROOM_H}m RX={RX_POS}, {len(NODE_POSITIONS)} TX(s) from {LAYOUT_FILE}", flush=True)
     except Exception as e:
         print(f"[layout] load failed: {e}", flush=True)
+
+
+def save_calibration():
+    """Write the measured elongation scale to JSON. Called under lock."""
+    try:
+        with open(CALIBRATION_FILE, "w") as f:
+            json.dump({"elongation_scale": ELONGATION_SCALE}, f, indent=2)
+        print(f"[calibration] saved scale={ELONGATION_SCALE:.3f} to {CALIBRATION_FILE}", flush=True)
+    except Exception as e:
+        print(f"[calibration] save failed: {e}", flush=True)
+
+
+def load_calibration():
+    """Load the measured elongation scale from JSON on startup."""
+    global ELONGATION_SCALE
+    if not os.path.exists(CALIBRATION_FILE):
+        return
+    try:
+        with open(CALIBRATION_FILE) as f:
+            data = json.load(f)
+        if "elongation_scale" in data:
+            ELONGATION_SCALE = float(data["elongation_scale"])
+        print(f"[calibration] loaded scale={ELONGATION_SCALE:.3f} from {CALIBRATION_FILE}", flush=True)
+    except Exception as e:
+        print(f"[calibration] load failed: {e}", flush=True)
 
 # Per-MAC state
 amp_windows = defaultdict(lambda: deque(maxlen=WINDOW_FRAMES))       # recent amplitude vectors (non-null subcarriers)
@@ -280,9 +356,11 @@ meta = {}                  # mac -> dict(rssi, noise, sig_mode, rate, mcs, cwb, 
 baseline_capture = {"active": False, "until": 0.0, "samples": defaultdict(list)}
 
 null_mask_cache = {}       # mac -> boolean numpy-free list, True = active subcarrier
+win_phy_key = {}           # mac -> (n_amps, sig_mode, rate, mcs, cwb) of current window's frames
 
 baseline = load_baseline()  # persisted across restarts via baseline.json
 load_layout()               # restores RX_POS and NODE_POSITIONS from layout.json
+load_calibration()          # restores ELONGATION_SCALE from calibration.json
 
 
 def iq_to_amplitude(values):
@@ -306,22 +384,37 @@ def iq_to_amplitude(values):
     return amps, actives
 
 
-def compute_cov(amp_window, actives):
+def window_active_mask(actives_list):
+    """
+    Intersection of per-frame active-subcarrier masks: True only for indices
+    active in every frame of the window. A subcarrier that goes null in even
+    one frame is excluded from that frame's amplitude (stored as 0.0), so
+    including it based on any single frame's mask would mix real amplitude
+    samples with null-subcarrier zeros in the same series.
+    """
+    if not actives_list:
+        return []
+    n = min(len(a) for a in actives_list)
+    return [all(a[i] for a in actives_list) for i in range(n)]
+
+
+def compute_cov(amp_actives_window):
     """
     Coefficient of variation (std/mean) per active subcarrier, then averaged
     across active subcarriers -- your validated room-independent motion signal.
-    amp_window: list of amplitude-vectors (one per frame in the sliding window)
+    amp_actives_window: list of (amps, actives) tuples, one per frame in the
+    sliding window. Returns (cov, active_idx).
     """
-    if not amp_window:
-        return 0.0
-    n_sub = min(len(amp_window[0]), len(actives))
-    active_idx = [i for i in range(n_sub) if actives[i]]
+    if not amp_actives_window:
+        return 0.0, []
+    mask = window_active_mask([actives for _, actives in amp_actives_window])
+    active_idx = [i for i, ok in enumerate(mask) if ok]
     if not active_idx:
-        return 0.0
+        return 0.0, []
 
     covs = []
     for i in active_idx:
-        series = [frame[i] for frame in amp_window]
+        series = [amps[i] for amps, _ in amp_actives_window]
         m = sum(series) / len(series)
         if m == 0:
             continue
@@ -329,8 +422,8 @@ def compute_cov(amp_window, actives):
         std = var ** 0.5
         covs.append(std / m)
     if not covs:
-        return 0.0
-    return sum(covs) / len(covs)
+        return 0.0, []
+    return sum(covs) / len(covs), active_idx
 
 
 def udp_listener(host, port):
@@ -369,16 +462,21 @@ def udp_listener(host, port):
         amps, actives = iq_to_amplitude(values)
 
         with lock:
-            # only append if length matches existing window to keep frames comparable
+            # Reset the window on any change to length or PHY parameters --
+            # amplitudes are only comparable within one constant configuration.
             win = amp_windows[mac_str]
-            if win and len(win[0]) != len(amps):
+            phy_key = (len(amps), sig_mode, rate, mcs, cwb)
+            if win and win_phy_key.get(mac_str) != phy_key:
                 win.clear()
                 heatmap_hist[mac_str].clear()
-            amp_windows[mac_str].append(amps)
-            heatmap_hist[mac_str].append(amps)
-            null_mask_cache[mac_str] = actives
+            win_phy_key[mac_str] = phy_key
 
-            cov = compute_cov(list(amp_windows[mac_str]), actives)
+            amp_windows[mac_str].append((amps, actives))
+            heatmap_hist[mac_str].append(amps)
+
+            cov, active_idx = compute_cov(list(amp_windows[mac_str]))
+            active_set = set(active_idx)
+            null_mask_cache[mac_str] = [i in active_set for i in range(len(amps))]
             cov_history[mac_str].append(cov)
 
             if baseline_capture["active"]:
@@ -526,7 +624,11 @@ def handle_set_layout(data):
         if data.get("rx"):
             RX_POS = (float(data["x"]), float(data["y"]))
         elif "mac" in data:
-            NODE_POSITIONS[data["mac"]] = (float(data["x"]), float(data["y"]))
+            # Normalize to match the uppercase MAC strings the UDP listener
+            # builds (":".join(f"{b:02X}"...)) -- otherwise a mismatched case
+            # silently never matches incoming traffic and the node never
+            # participates in localization.
+            NODE_POSITIONS[data["mac"].strip().upper()] = (float(data["x"]), float(data["y"]))
         save_layout()
     socketio.emit("layout_ack", {
         "room_w": ROOM_W, "room_h": ROOM_H,
@@ -535,10 +637,79 @@ def handle_set_layout(data):
     })
 
 
+@socketio.on("calibrate_scale")
+def handle_calibrate_scale(data):
+    """
+    data: { x: <metres>, y: <metres>, duration: <seconds, default 5> }
+    Stand at a known (x, y) point (measured against the same tape-measured
+    origin as the node layout) and capture live CoV. For each configured
+    link, the true path elongation is computable from geometry alone
+    (dist(tx,point) + dist(point,rx))/2 - dist(tx,rx)/2); comparing that to
+    the observed CoV excess above baseline gives a measured elongation_scale
+    (metres per unit CoV excess), replacing the hardcoded guess.
+    """
+    try:
+        point = (float(data["x"]), float(data["y"]))
+    except (KeyError, TypeError, ValueError):
+        socketio.emit("calibration_status", {"phase": "error", "message": "x and y are required"})
+        return
+    duration = float(data.get("duration", 5))
+
+    socketio.emit("calibration_status", {"phase": "capturing", "duration": duration, "point": list(point)})
+
+    def run():
+        global ELONGATION_SCALE
+        samples = defaultdict(list)
+        end = time.time() + duration
+        while time.time() < end:
+            time.sleep(0.1)
+            with lock:
+                for mac in NODE_POSITIONS:
+                    series = cov_history.get(mac)
+                    if series:
+                        samples[mac].append(series[-1])
+
+        with lock:
+            ratios = []
+            per_link = {}
+            for mac, tx_pos in NODE_POSITIONS.items():
+                base = baseline.get(mac)
+                covs = samples.get(mac)
+                if base is None or not covs:
+                    continue
+                avg_cov = sum(covs) / len(covs)
+                threshold = base["mean"] + 3 * base["std"]
+                excess = avg_cov - threshold
+                c = _dist(tx_pos, RX_POS) / 2
+                a_true = (_dist(tx_pos, point) + _dist(point, RX_POS)) / 2
+                delta_true = max(0.0, a_true - c)
+                if excess > 1e-6:
+                    ratio = delta_true / excess
+                    ratios.append(ratio)
+                    per_link[mac] = {"excess": round(excess, 4),
+                                      "delta_true_m": round(delta_true, 4),
+                                      "scale": round(ratio, 3)}
+
+            if ratios:
+                ELONGATION_SCALE = sum(ratios) / len(ratios)
+                save_calibration()
+                socketio.emit("calibration_status", {
+                    "phase": "done", "scale": round(ELONGATION_SCALE, 3), "per_link": per_link,
+                })
+            else:
+                socketio.emit("calibration_status", {
+                    "phase": "failed",
+                    "message": "no configured link showed CoV excess above its baseline during "
+                               "capture -- stand where motion is actually sensed and recapture",
+                })
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 @socketio.on("remove_node")
 def handle_remove_node(data):
     with lock:
-        NODE_POSITIONS.pop(data.get("mac", ""), None)
+        NODE_POSITIONS.pop(data.get("mac", "").strip().upper(), None)
         save_layout()
     socketio.emit("layout_ack", {
         "room_w": ROOM_W, "room_h": ROOM_H,

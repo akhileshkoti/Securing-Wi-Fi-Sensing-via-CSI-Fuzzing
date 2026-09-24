@@ -280,6 +280,17 @@
                     <button onclick="setRx()">Set RX</button>
                 </div>
                 <div id="loc-status" style="margin-top:6px;">Assign MACs to TX positions to enable localization</div>
+
+                <div style="color:var(--muted); margin: 10px 0 4px;">Elongation scale calibration</div>
+                <div class="row">
+                    <label>x (m)<input type="number" id="cal-x" step="0.01" value="1.37"></label>
+                    <label>y (m)<input type="number" id="cal-y" step="0.01" value="2.44"></label>
+                    <label>dur (s)<input type="number" id="cal-dur" step="1" value="5"></label>
+                    <button onclick="calibrateScale()">Calibrate</button>
+                </div>
+                <div id="cal-status" style="margin-top:4px; font-size:11px; color:var(--muted);">
+                    Stand at the (x, y) point above (tape-measured, same origin as node layout), then Calibrate
+                </div>
             </div>
         </div>
     </div>
@@ -683,6 +694,25 @@
             const y = parseFloat(document.getElementById('rx-y').value);
             socket.emit('set_layout', { rx: true, x, y });
         }
+
+        function calibrateScale() {
+            const x = parseFloat(document.getElementById('cal-x').value);
+            const y = parseFloat(document.getElementById('cal-y').value);
+            const duration = parseFloat(document.getElementById('cal-dur').value) || 5;
+            if (isNaN(x) || isNaN(y)) { alert('Enter the point you are standing at'); return; }
+            socket.emit('calibrate_scale', { x, y, duration });
+        }
+
+        socket.on('calibration_status', (s) => {
+            const el = document.getElementById('cal-status');
+            if (s.phase === 'capturing') {
+                el.textContent = `capturing at (${s.point[0]}, ${s.point[1]})... stay put for ${s.duration}s`;
+            } else if (s.phase === 'done') {
+                el.textContent = `elongation_scale = ${s.scale} (from ${Object.keys(s.per_link).length} link(s))`;
+            } else if (s.phase === 'failed' || s.phase === 'error') {
+                el.textContent = s.message;
+            }
+        });
 
         // draw empty room on load
         addTxRow();   // start with one empty TX row
