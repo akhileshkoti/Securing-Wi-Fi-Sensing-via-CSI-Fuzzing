@@ -295,6 +295,7 @@ def save_baseline():
         print(f"[baseline] saved to {BASELINE_FILE}", flush=True)
     except Exception as e:
         print(f"[baseline] save failed: {e}", flush=True)
+    sync_active_profile()
 
 def load_baseline():
     """Load baseline from JSON on startup. Returns dict or {}."""
@@ -323,6 +324,7 @@ def save_layout():
         print(f"[layout] saved to {LAYOUT_FILE}", flush=True)
     except Exception as e:
         print(f"[layout] save failed: {e}", flush=True)
+    sync_active_profile()
 
 def load_layout():
     """Load node positions and room dimensions from JSON on startup."""
@@ -353,6 +355,7 @@ def save_calibration():
         print(f"[calibration] saved scale={ELONGATION_SCALE:.3f} to {CALIBRATION_FILE}", flush=True)
     except Exception as e:
         print(f"[calibration] save failed: {e}", flush=True)
+    sync_active_profile()
 
 
 def load_calibration():
@@ -369,6 +372,107 @@ def load_calibration():
     except Exception as e:
         print(f"[calibration] load failed: {e}", flush=True)
 
+
+# ---------------------------------------------------------------------------
+# Room profiles. Each profile is a full snapshot of everything that is
+# specific to one physical room: dimensions, node layout, the empty-room
+# baseline and the measured elongation scale. Baseline and scale are
+# included because both are properties of that room's propagation (walls,
+# furniture, reflections) -- reusing them in a different room silently
+# breaks presence detection and localization.
+#
+# layout.json / baseline.json / calibration.json remain the live working
+# state; every save of those also writes through to the active profile, so
+# edits made after switching rooms are kept with that room automatically.
+# ---------------------------------------------------------------------------
+PROFILES_FILE = os.path.join(os.path.dirname(__file__), "profiles.json")
+PROFILE_NAME_MAX = 40
+
+profiles = {"active": None, "profiles": {}}
+busy_tasks = set()   # running "baseline"/"calibration" captures; profile switch waits for these
+
+
+def current_snapshot():
+    """Live room state as a profile dict. Called under lock."""
+    return {
+        "room_w": ROOM_W,
+        "room_h": ROOM_H,
+        "rx": list(RX_POS),
+        "nodes": {mac: list(pos) for mac, pos in NODE_POSITIONS.items()},
+        "elongation_scale": ELONGATION_SCALE,
+        "baseline": dict(baseline),
+    }
+
+
+def save_profiles():
+    """Write all profiles to JSON. Called under lock."""
+    try:
+        with open(PROFILES_FILE, "w") as f:
+            json.dump(profiles, f, indent=2)
+    except Exception as e:
+        print(f"[profiles] save failed: {e}", flush=True)
+
+
+def load_profiles():
+    """Load profiles from JSON on startup. Called after the live state is loaded."""
+    global profiles
+    if os.path.exists(PROFILES_FILE):
+        try:
+            with open(PROFILES_FILE) as f:
+                data = json.load(f)
+            profiles = {"active": data.get("active"), "profiles": data.get("profiles", {})}
+            if profiles["active"] not in profiles["profiles"]:
+                profiles["active"] = None
+            print(f"[profiles] loaded {len(profiles['profiles'])} profile(s), "
+                  f"active={profiles['active']!r} from {PROFILES_FILE}", flush=True)
+            return
+        except Exception as e:
+            print(f"[profiles] load failed: {e}", flush=True)
+            return
+    # First run with profiles: adopt the existing setup as "Default" so
+    # nothing configured so far is lost.
+    profiles = {"active": "Default", "profiles": {"Default": current_snapshot()}}
+    save_profiles()
+    print("[profiles] created 'Default' from the existing layout", flush=True)
+
+
+def sync_active_profile():
+    """Write the live state through to the active profile. Called under lock."""
+    name = profiles["active"]
+    if name is None:
+        return
+    profiles["profiles"][name] = current_snapshot()
+    save_profiles()
+
+
+def apply_profile(p):
+    """Replace the live state with profile dict p and persist it. Called under lock."""
+    global ROOM_W, ROOM_H, RX_POS, ELONGATION_SCALE
+    ROOM_W = float(p["room_w"])
+    ROOM_H = float(p["room_h"])
+    RX_POS = tuple(p["rx"])
+    NODE_POSITIONS.clear()
+    for mac, pos in p.get("nodes", {}).items():
+        NODE_POSITIONS[mac.strip().upper()] = tuple(pos)
+    ELONGATION_SCALE = float(p.get("elongation_scale", ELONGATION_SCALE))
+    baseline.clear()
+    baseline.update(p.get("baseline", {}))
+    save_layout()
+    save_baseline()
+    save_calibration()
+
+
+def profiles_payload():
+    return {"active": profiles["active"], "names": sorted(profiles["profiles"])}
+
+
+def layout_payload():
+    return {
+        "room_w": ROOM_W, "room_h": ROOM_H,
+        "node_positions": {k: list(v) for k, v in NODE_POSITIONS.items()},
+        "rx_pos": list(RX_POS),
+    }
+
 # Per-MAC state
 amp_windows = defaultdict(lambda: deque(maxlen=WINDOW_FRAMES))       # recent amplitude vectors (non-null subcarriers)
 heatmap_hist = defaultdict(lambda: deque(maxlen=HEATMAP_HISTORY))    # recent amplitude vectors for heatmap
@@ -382,6 +486,7 @@ win_phy_key = {}           # mac -> (n_amps, sig_mode, rate, mcs, cwb) of curren
 baseline = load_baseline()  # persisted across restarts via baseline.json
 load_layout()               # restores RX_POS and NODE_POSITIONS from layout.json
 load_calibration()          # restores ELONGATION_SCALE from calibration.json
+load_profiles()             # room profiles; must follow the three loads above
 
 
 def iq_to_amplitude(values):
@@ -572,11 +677,8 @@ def index():
 def handle_connect():
     """Send persisted layout and baseline status to a newly connected client."""
     with lock:
-        socketio.emit("layout_ack", {
-            "room_w": ROOM_W, "room_h": ROOM_H,
-            "node_positions": {k: list(v) for k, v in NODE_POSITIONS.items()},
-            "rx_pos": list(RX_POS),
-        })
+        socketio.emit("layout_ack", layout_payload())
+        socketio.emit("profiles", profiles_payload())
         if baseline:
             socketio.emit("baseline_status", {"phase": "done", "baseline": baseline})
 
@@ -586,9 +688,11 @@ def handle_start_baseline(data):
     duration = float(data.get("duration", 8))
     delay = float(data.get("delay", 30))
 
+    with lock:
+        busy_tasks.add("baseline")
     socketio.emit("baseline_status", {"phase": "countdown", "delay": delay, "duration": duration})
 
-    def run():
+    def capture():
         # Grace period so the user can leave the room before recording starts.
         remaining = delay
         while remaining > 0:
@@ -616,6 +720,13 @@ def handle_start_baseline(data):
             save_baseline()
         socketio.emit("baseline_status", {"phase": "done", "baseline": baseline})
 
+    def run():
+        try:
+            capture()
+        finally:
+            with lock:
+                busy_tasks.discard("baseline")
+
     threading.Thread(target=run, daemon=True).start()
 
 
@@ -626,11 +737,7 @@ def handle_set_room(data):
         ROOM_W = float(data.get("w", ROOM_W))
         ROOM_H = float(data.get("h", ROOM_H))
         save_layout()
-    socketio.emit("layout_ack", {
-        "room_w": ROOM_W, "room_h": ROOM_H,
-        "node_positions": {k: list(v) for k, v in NODE_POSITIONS.items()},
-        "rx_pos": list(RX_POS),
-    })
+    socketio.emit("layout_ack", layout_payload())
 
 
 @socketio.on("set_layout")
@@ -651,11 +758,7 @@ def handle_set_layout(data):
             # participates in localization.
             NODE_POSITIONS[data["mac"].strip().upper()] = (float(data["x"]), float(data["y"]))
         save_layout()
-    socketio.emit("layout_ack", {
-        "room_w": ROOM_W, "room_h": ROOM_H,
-        "node_positions": {k: list(v) for k,v in NODE_POSITIONS.items()},
-        "rx_pos": list(RX_POS),
-    })
+    socketio.emit("layout_ack", layout_payload())
 
 
 @socketio.on("calibrate_scale")
@@ -676,9 +779,11 @@ def handle_calibrate_scale(data):
         return
     duration = float(data.get("duration", 5))
 
+    with lock:
+        busy_tasks.add("calibration")
     socketio.emit("calibration_status", {"phase": "capturing", "duration": duration, "point": list(point)})
 
-    def run():
+    def capture():
         global ELONGATION_SCALE
         samples = defaultdict(list)
         end = time.time() + duration
@@ -724,6 +829,13 @@ def handle_calibrate_scale(data):
                                "capture -- stand where motion is actually sensed and recapture",
                 })
 
+    def run():
+        try:
+            capture()
+        finally:
+            with lock:
+                busy_tasks.discard("calibration")
+
     threading.Thread(target=run, daemon=True).start()
 
 
@@ -732,11 +844,7 @@ def handle_remove_node(data):
     with lock:
         NODE_POSITIONS.pop(data.get("mac", "").strip().upper(), None)
         save_layout()
-    socketio.emit("layout_ack", {
-        "room_w": ROOM_W, "room_h": ROOM_H,
-        "node_positions": {k: list(v) for k,v in NODE_POSITIONS.items()},
-        "rx_pos": list(RX_POS),
-    })
+    socketio.emit("layout_ack", layout_payload())
 
 
 @socketio.on("clear_baseline")
@@ -745,6 +853,79 @@ def handle_clear_baseline():
         baseline.clear()
         save_baseline()
     socketio.emit("baseline_status", {"phase": "cleared", "baseline": {}})
+
+
+def _profile_error(message):
+    socketio.emit("profile_status", {"phase": "error", "message": message})
+
+
+@socketio.on("save_profile")
+def handle_save_profile(data):
+    """
+    data: { name: "Bedroom" }
+    Saves the current room setup (layout, baseline, scale) under name and
+    makes it the active profile. Overwrites an existing profile of that name.
+    """
+    name = str(data.get("name", "")).strip()
+    if not name or len(name) > PROFILE_NAME_MAX:
+        _profile_error(f"profile name must be 1-{PROFILE_NAME_MAX} characters")
+        return
+    with lock:
+        profiles["profiles"][name] = current_snapshot()
+        profiles["active"] = name
+        save_profiles()
+    socketio.emit("profiles", profiles_payload())
+    socketio.emit("profile_status", {"phase": "saved", "name": name})
+
+
+@socketio.on("load_profile")
+def handle_load_profile(data):
+    """
+    data: { name: "Bedroom" }
+    Switches the live room setup to a saved profile.
+    """
+    name = str(data.get("name", "")).strip()
+    with lock:
+        if busy_tasks:
+            # A running capture would write its result into whichever room
+            # is active when it finishes -- i.e. the wrong one.
+            busy = " and ".join(sorted(busy_tasks))
+            _profile_error(f"wait for the {busy} capture to finish before switching rooms")
+            return
+        p = profiles["profiles"].get(name)
+        if p is None:
+            _profile_error(f"no profile named {name!r}")
+            return
+        profiles["active"] = name
+        apply_profile(p)
+        save_profiles()
+        has_baseline = bool(baseline)
+        scale = ELONGATION_SCALE
+    socketio.emit("profiles", profiles_payload())
+    socketio.emit("layout_ack", layout_payload())
+    socketio.emit("baseline_status", {"phase": "loaded" if has_baseline else "cleared",
+                                      "baseline": baseline})
+    socketio.emit("calibration_status", {"phase": "loaded", "scale": round(scale, 3)})
+    socketio.emit("profile_status", {"phase": "loaded", "name": name})
+
+
+@socketio.on("delete_profile")
+def handle_delete_profile(data):
+    """
+    data: { name: "Bedroom" }
+    Deletes a saved profile. Deleting the active one leaves the current
+    setup in place, just no longer saved under any profile.
+    """
+    name = str(data.get("name", "")).strip()
+    with lock:
+        if profiles["profiles"].pop(name, None) is None:
+            _profile_error(f"no profile named {name!r}")
+            return
+        if profiles["active"] == name:
+            profiles["active"] = None
+        save_profiles()
+    socketio.emit("profiles", profiles_payload())
+    socketio.emit("profile_status", {"phase": "deleted", "name": name})
 
 
 def main():

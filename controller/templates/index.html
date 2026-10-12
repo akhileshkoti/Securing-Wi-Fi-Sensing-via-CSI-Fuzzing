@@ -195,6 +195,17 @@
             border-radius: 4px;
         }
 
+        #layout-warn {
+            display: none;
+            margin-bottom: 10px;
+            padding: 6px 8px;
+            border: 1px solid var(--warn);
+            border-radius: 4px;
+            color: var(--warn);
+            font-size: 11px;
+            line-height: 1.4;
+        }
+
         #layout-form {
             font-size: 11px;
             color: var(--muted);
@@ -210,7 +221,8 @@
             gap: 2px;
         }
 
-        #layout-form input[type=text] {
+        #layout-form input[type=text],
+        #layout-form select {
             background: var(--bg);
             border: 1px solid var(--panel-border);
             color: var(--text);
@@ -261,6 +273,19 @@
                 <canvas id="room-canvas" width="300" height="533"></canvas>
             </div>
             <div id="layout-form">
+                <div style="color:var(--accent); margin-bottom:8px; font-size:12px;">Room profile</div>
+                <div class="row" style="margin-bottom:6px;">
+                    <select id="profile-select" onchange="loadProfile()" style="flex:1;"></select>
+                    <button onclick="deleteProfile()" title="Delete selected profile">Delete</button>
+                </div>
+                <div class="row" style="margin-bottom:4px;">
+                    <input type="text" id="profile-name" placeholder="New profile name" maxlength="40" style="flex:1;">
+                    <button onclick="saveProfile()">Save as</button>
+                </div>
+                <div id="profile-status" style="margin-bottom:12px; font-size:11px; color:var(--muted);">
+                    Changes are saved to the active profile automatically
+                </div>
+
                 <div style="color:var(--accent); margin-bottom:8px; font-size:12px;">Node positions</div>
 
                 <div style="color:var(--muted); margin-bottom:4px;">Room dimensions</div>
@@ -269,6 +294,7 @@
                     <label>H/N-S (m)<input type="number" id="room-h" step="0.01" value="4.877"></label>
                     <button onclick="setRoom()">Set</button>
                 </div>
+                <div id="layout-warn"></div>
 
                 <div id="tx-list"></div>
                 <button onclick="addTxRow()" style="width:100%; margin-bottom:10px;">+ Add TX</button>
@@ -326,8 +352,10 @@
                 statusEl.textContent = `capturing baseline, keep room empty (${s.duration}s)`;
             } else if (s.phase === 'done') {
                 statusEl.textContent = 'baseline captured — connected';
+            } else if (s.phase === 'loaded') {
+                statusEl.textContent = 'room baseline loaded — connected';
             } else if (s.phase === 'cleared') {
-                statusEl.textContent = 'baseline cleared — connected';
+                statusEl.textContent = 'no baseline for this room — capture one';
             }
         });
 
@@ -479,7 +507,50 @@
 
         // Room real dimensions (metres) — kept in sync with server via layout_ack
         let roomW = 2.743, roomH = 4.877;
-        const CANVAS_W = 300, CANVAS_H = 533;
+        // Canvas is sized to the room's real aspect ratio so 1 m is the same
+        // number of pixels on both axes (a fixed 300x533 box stretched any
+        // room that wasn't 9:16). The room is fit inside this bounding box.
+        const CANVAS_MAX_W = 300, CANVAS_MAX_H = 533;
+        let CANVAS_W = CANVAS_MAX_W, CANVAS_H = CANVAS_MAX_H;
+        // Positions within this distance of a wall count as on the wall, so
+        // a node tape-measured onto the wall doesn't trip the warning.
+        const WALL_TOLERANCE_M = 0.01;
+        // Latest layout from layout_ack; nodes are drawn from this so they
+        // show (and the warning updates) even before any CSI packets arrive.
+        let layoutNodes = [];
+
+        function resizeRoomCanvas() {
+            const scale = Math.min(CANVAS_MAX_W / roomW, CANVAS_MAX_H / roomH);
+            const w = Math.max(1, Math.round(roomW * scale));
+            const h = Math.max(1, Math.round(roomH * scale));
+            if (w === CANVAS_W && h === CANVAS_H) return;
+            CANVAS_W = w;
+            CANVAS_H = h;
+            // assigning width/height clears the canvas; the caller redraws
+            roomCanvas.width = w;
+            roomCanvas.height = h;
+        }
+
+        function isOutside(node) {
+            return node.x < -WALL_TOLERANCE_M || node.x > roomW + WALL_TOLERANCE_M ||
+                   node.y < -WALL_TOLERANCE_M || node.y > roomH + WALL_TOLERANCE_M;
+        }
+
+        function updateLayoutWarning() {
+            const warnEl = document.getElementById('layout-warn');
+            const outside = layoutNodes.filter(isOutside);
+            if (outside.length === 0) {
+                warnEl.style.display = 'none';
+                warnEl.textContent = '';
+                return;
+            }
+            const lines = outside.map(n =>
+                `${n.type === 'rx' ? 'RX' : 'TX ' + n.mac} at (${n.x.toFixed(2)}, ${n.y.toFixed(2)})`);
+            warnEl.textContent =
+                `⚠ ${outside.length} node(s) outside the ${roomW.toFixed(2)} × ${roomH.toFixed(2)} m room — ` +
+                `localization will be wrong until fixed: ${lines.join('; ')}`;
+            warnEl.style.display = 'block';
+        }
 
         function toCanvas(x, y) {
             // world (x=east, y=north) -> canvas (origin top-left, y flipped)
@@ -490,6 +561,7 @@
         }
 
         function drawRoom(loc) {
+            resizeRoomCanvas();
             roomCtx.clearRect(0, 0, CANVAS_W, CANVAS_H);
 
             // background
@@ -563,30 +635,39 @@
                 roomCtx.fill();
             }
 
-            // nodes
-            if (loc && loc.nodes) {
-                for (const node of loc.nodes) {
-                    const [nx, ny] = toCanvas(node.x, node.y);
+            // nodes -- out-of-room nodes are pinned to the nearest edge and
+            // ringed in red so they stay visible instead of vanishing off-canvas
+            for (const node of layoutNodes) {
+                const outside = isOutside(node);
+                let [nx, ny] = toCanvas(node.x, node.y);
+                nx = Math.min(Math.max(nx, 8), CANVAS_W - 8);
+                ny = Math.min(Math.max(ny, 8), CANVAS_H - 8);
+                if (outside) {
                     roomCtx.beginPath();
-                    if (node.type === 'rx') {
-                        // diamond for RX
-                        roomCtx.moveTo(nx, ny - 8);
-                        roomCtx.lineTo(nx + 7, ny);
-                        roomCtx.lineTo(nx, ny + 8);
-                        roomCtx.lineTo(nx - 7, ny);
-                        roomCtx.closePath();
-                        roomCtx.fillStyle = '#4ade80';
-                        roomCtx.fill();
-                    } else {
-                        // circle for TX
-                        roomCtx.arc(nx, ny, 7, 0, Math.PI * 2);
-                        roomCtx.fillStyle = '#5ec6ff';
-                        roomCtx.fill();
-                    }
-                    roomCtx.fillStyle = '#e6e8ec';
-                    roomCtx.font = '10px monospace';
-                    roomCtx.fillText(node.label, nx + 9, ny + 4);
+                    roomCtx.arc(nx, ny, 11, 0, Math.PI * 2);
+                    roomCtx.strokeStyle = '#ff6b6b';
+                    roomCtx.lineWidth = 2;
+                    roomCtx.stroke();
                 }
+                roomCtx.beginPath();
+                if (node.type === 'rx') {
+                    // diamond for RX
+                    roomCtx.moveTo(nx, ny - 8);
+                    roomCtx.lineTo(nx + 7, ny);
+                    roomCtx.lineTo(nx, ny + 8);
+                    roomCtx.lineTo(nx - 7, ny);
+                    roomCtx.closePath();
+                    roomCtx.fillStyle = '#4ade80';
+                    roomCtx.fill();
+                } else {
+                    // circle for TX
+                    roomCtx.arc(nx, ny, 7, 0, Math.PI * 2);
+                    roomCtx.fillStyle = '#5ec6ff';
+                    roomCtx.fill();
+                }
+                roomCtx.fillStyle = '#e6e8ec';
+                roomCtx.font = '10px monospace';
+                roomCtx.fillText(node.label, nx + 9, ny + 4);
             }
 
             // compass / scale
@@ -595,6 +676,7 @@
             roomCtx.fillText('N', CANVAS_W / 2 - 3, 12);
             roomCtx.fillText('S', CANVAS_W / 2 - 3, CANVAS_H - 4);
             roomCtx.fillText(`${roomH.toFixed(1)}m`, 4, CANVAS_H / 2);
+            roomCtx.fillText(`${roomW.toFixed(1)}m`, CANVAS_W - 30, CANVAS_H - 4);
 
             // localization status
             if (loc) {
@@ -613,12 +695,28 @@
         socket.on('localization', (loc) => {
             roomW = loc.room_w;
             roomH = loc.room_h;
+            updateLayoutWarning();
             drawRoom(loc);
         });
 
         socket.on('layout_ack', (data) => {
             if (data.room_w) document.getElementById('room-w').value = data.room_w;
             if (data.room_h) document.getElementById('room-h').value = data.room_h;
+            if (data.room_w) roomW = data.room_w;
+            if (data.room_h) roomH = data.room_h;
+            layoutNodes = [];
+            if (data.rx_pos) {
+                layoutNodes.push({ type: 'rx', label: 'RX', x: data.rx_pos[0], y: data.rx_pos[1] });
+            }
+            for (const [mac, pos] of Object.entries(data.node_positions || {})) {
+                layoutNodes.push({ type: 'tx', mac, label: mac.slice(-5), x: pos[0], y: pos[1] });
+            }
+            updateLayoutWarning();
+            // Redraw right away (resizes the canvas to the new room) instead of
+            // waiting for the next localization tick, which never comes if no
+            // CSI is flowing. The old heatmap/ellipses are for the previous
+            // geometry, so they're dropped until the next tick.
+            drawRoom(null);
             if (data.rx_pos) {
                 document.getElementById('rx-x').value = data.rx_pos[0];
                 document.getElementById('rx-y').value = data.rx_pos[1];
@@ -709,10 +807,69 @@
                 el.textContent = `capturing at (${s.point[0]}, ${s.point[1]})... stay put for ${s.duration}s`;
             } else if (s.phase === 'done') {
                 el.textContent = `elongation_scale = ${s.scale} (from ${Object.keys(s.per_link).length} link(s))`;
+            } else if (s.phase === 'loaded') {
+                el.textContent = `elongation_scale = ${s.scale} (from room profile)`;
             } else if (s.phase === 'failed' || s.phase === 'error') {
                 el.textContent = s.message;
             }
         });
+
+        // ── Room profiles ───────────────────────────────────────────────────────────
+        const UNSAVED = '';   // <option> value shown when no profile is active
+        let activeProfile = null;
+
+        socket.on('profiles', (p) => {
+            activeProfile = p.active;
+            const sel = document.getElementById('profile-select');
+            sel.innerHTML = '';
+            if (p.active === null) {
+                // live setup isn't saved under any profile; edits won't persist to one
+                sel.add(new Option('(unsaved setup)', UNSAVED));
+            }
+            for (const name of p.names) sel.add(new Option(name, name));
+            sel.value = p.active === null ? UNSAVED : p.active;
+        });
+
+        socket.on('profile_status', (s) => {
+            const el = document.getElementById('profile-status');
+            el.style.color = s.phase === 'error' ? 'var(--warn)' : 'var(--muted)';
+            if (s.phase === 'error') {
+                el.textContent = s.message;
+                // revert the dropdown to the profile that is actually active
+                document.getElementById('profile-select').value =
+                    activeProfile === null ? UNSAVED : activeProfile;
+            } else if (s.phase === 'saved') {
+                el.textContent = `Saved current setup as "${s.name}"`;
+                document.getElementById('profile-name').value = '';
+            } else if (s.phase === 'loaded') {
+                el.textContent = `Switched to "${s.name}"`;
+            } else if (s.phase === 'deleted') {
+                el.textContent = `Deleted "${s.name}"` +
+                    (activeProfile === null ? ' — current setup is now unsaved' : '');
+            }
+        });
+
+        function loadProfile() {
+            const name = document.getElementById('profile-select').value;
+            if (name === UNSAVED || name === activeProfile) return;
+            socket.emit('load_profile', { name });
+        }
+
+        function saveProfile() {
+            const name = document.getElementById('profile-name').value.trim();
+            if (!name) { alert('Enter a profile name'); return; }
+            const exists = [...document.getElementById('profile-select').options]
+                .some(o => o.value === name);
+            if (exists && !confirm(`Overwrite profile "${name}" with the current setup?`)) return;
+            socket.emit('save_profile', { name });
+        }
+
+        function deleteProfile() {
+            const name = document.getElementById('profile-select').value;
+            if (name === UNSAVED) return;
+            if (!confirm(`Delete profile "${name}"? This can't be undone.`)) return;
+            socket.emit('delete_profile', { name });
+        }
 
         // draw empty room on load
         addTxRow();   // start with one empty TX row
