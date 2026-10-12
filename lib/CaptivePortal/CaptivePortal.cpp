@@ -19,6 +19,7 @@ void CaptivePortal::begin() {
   _server.begin();
   Serial.printf("[Portal] Join '%s' then open http://%s\n",
                 apName.c_str(), _apIP.toString().c_str());
+  Serial.printf("[Portal] This board's MAC: %s\n", stationMacString().c_str());
 }
 
 void CaptivePortal::loop() {
@@ -27,7 +28,10 @@ void CaptivePortal::loop() {
 }
 
 void CaptivePortal::handleRoot() {
-  _server.send_P(200, "text/html", PORTAL_FORM_HTML);
+  String page = FPSTR(PORTAL_FORM_HTML);
+  page.replace("{{MAC}}", stationMacString());
+  page.replace("{{DEVICE_ID}}", deviceId());
+  _server.send(200, "text/html", page);
 }
 
 void CaptivePortal::handleSave() {
@@ -46,7 +50,8 @@ void CaptivePortal::handleSave() {
   _server.send(200, "text/html",
     "<h3>Saved. Rebooting...</h3><p>SSID: " + cfg.ssid +
     "<br>Role: " + roleToString(cfg.role) +
-    "<br>Server: " + cfg.serverIp + "</p>");
+    "<br>Server: " + cfg.serverIp +
+    "<br>MAC: " + stationMacString() + "</p>");
   delay(1500);
   ESP.restart();
 }

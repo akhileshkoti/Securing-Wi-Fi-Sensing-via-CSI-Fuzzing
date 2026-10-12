@@ -1,6 +1,7 @@
 #pragma once
 
 // The setup form, kept out of the logic file for readability.
+// {{MAC}} and {{DEVICE_ID}} are filled in by CaptivePortal::handleRoot().
 const char PORTAL_FORM_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -50,11 +51,41 @@ const char PORTAL_FORM_HTML[] PROGMEM = R"rawliteral(
         button:hover {
             opacity: 0.9;
         }
+
+        .device {
+            margin: 0 0 8px;
+            padding: 12px;
+            border: 1px solid #c7d2fe;
+            border-radius: 6px;
+            background: #eef2ff;
+            text-align: center;
+        }
+
+        .device .mac {
+            display: block;
+            margin: 4px 0;
+            font-family: monospace;
+            font-size: 20px;
+            font-weight: 700;
+            letter-spacing: 1px;
+            user-select: all;   /* one tap selects the whole MAC for copying */
+        }
+
+        .device small {
+            color: #555;
+        }
     </style>
 </head>
 
 <body>
     <h2>ESP Configuration</h2>
+
+    <div class="device">
+        <small>This board's MAC (device {{DEVICE_ID}})</small>
+        <span class="mac">{{MAC}}</span>
+        <small>If this board is an Illuminator, enter this MAC as its TX
+        in the controller dashboard's Node positions.</small>
+    </div>
 
     <form action="/save" method="POST">
         <label for="ssid">Wi-Fi SSID</label>
