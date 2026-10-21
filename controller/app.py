@@ -29,6 +29,18 @@ WINDOW_FRAMES = 50          # ~1s at ~50Hz, per your validated motion-window siz
 HEATMAP_HISTORY = 200       # columns of amplitude history kept per illuminator
 EMIT_HZ = 10                # throttle UI updates regardless of packet rate
 
+# Static presence: compares the *shape* of the mean subcarrier amplitude
+# profile against an empty-room fingerprint, so a person who isn't moving
+# (and so leaves CoV at baseline) is still detected by the attenuation and
+# reflection their body adds.
+PRESENCE_WINDOW_S = 3.0         # averaging window for the presence score (also the fingerprint chunk size)
+PRESENCE_K = 3.0                # threshold = empty-room score mean + K * std ...
+PRESENCE_MIN_RATIO = 3.0        # ... but never below RATIO * mean: a 60s capture underestimates the
+                                # slow drift an empty room shows over minutes (measured: up to ~2.5x mean)
+PRESENCE_HOLD_S = 5.0           # room stays "occupied" this long after the last detection
+MIN_FINGERPRINT_CHUNKS = 5      # need >= 5 windows (~15s) of empty room to estimate the score spread
+MIN_FRAMES_PER_WINDOW = 5
+
 # ---------------------------------------------------------------------------
 # Room geometry  (SW corner = origin, x = East, y = North, all in metres)
 # Defaults: your 9ft x 16ft room. Updated live via set_room socket event.
@@ -213,6 +225,7 @@ def compute_localization(mac_covs, mac_baselines):
     ellipses = []
     links = []          # (tx_pos, a) per active link, for exact intersection refinement
     active_links = 0
+    any_excess = False  # True once any link's CoV is above its baseline threshold
 
     for mac, tx_pos in NODE_POSITIONS.items():
         if mac not in mac_covs:
@@ -223,6 +236,8 @@ def compute_localization(mac_covs, mac_baselines):
         cur_cov = mac_covs[mac]
         threshold = base["mean"] + 3*base["std"]
         excess = max(0.0, cur_cov - threshold)
+        if excess > 0:
+            any_excess = True
 
         # semi-major axis: direct path + excess elongation
         c = _dist(tx_pos, RX_POS)/2
@@ -239,6 +254,13 @@ def compute_localization(mac_covs, mac_baselines):
         ellipses.append({"tx": list(tx_pos), "rx": list(RX_POS), "pts": pts,
                           "excess": round(excess, 4)})
 
+    # With no excess on any link every ellipse has collapsed onto its direct
+    # TX-RX path, and those paths only meet at RX -- so the heatmap and blob
+    # would always point at the receiver whether or not anyone is there.
+    # Show nothing rather than that artefact.
+    if not any_excess:
+        combined = [0.0] * len(combined)
+
     # normalise
     if active_links > 0:
         max_s = max(combined) or 1.0
@@ -246,7 +268,7 @@ def compute_localization(mac_covs, mac_baselines):
 
     # find blob: coarse grid peak, refined to the actual ellipse intersection
     blob = None
-    if active_links >= 2 and max(combined) > 0.3:
+    if active_links >= 2 and any_excess and max(combined) > 0.3:
         peak_idx = combined.index(max(combined))
         gx = peak_idx % grid_n_x
         gy = peak_idx // grid_n_x
@@ -477,8 +499,10 @@ def layout_payload():
 amp_windows = defaultdict(lambda: deque(maxlen=WINDOW_FRAMES))       # recent amplitude vectors (non-null subcarriers)
 heatmap_hist = defaultdict(lambda: deque(maxlen=HEATMAP_HISTORY))    # recent amplitude vectors for heatmap
 cov_history = defaultdict(lambda: deque(maxlen=HEATMAP_HISTORY))     # recent CoV scalar values
+presence_frames = defaultdict(lambda: deque(maxlen=2000))            # (t, amps, actives) for the presence window
 meta = {}                  # mac -> dict(rssi, noise, sig_mode, rate, mcs, cwb, channel, secondary, last_seen, pkt_count)
-baseline_capture = {"active": False, "until": 0.0, "samples": defaultdict(list)}
+baseline_capture = {"active": False, "until": 0.0, "samples": defaultdict(list), "frames": defaultdict(list)}
+last_occupied_t = 0.0      # time of the last per-link motion/presence detection, for the room-level hold
 
 null_mask_cache = {}       # mac -> boolean numpy-free list, True = active subcarrier
 win_phy_key = {}           # mac -> (n_amps, sig_mode, rate, mcs, cwb) of current window's frames
@@ -552,6 +576,114 @@ def compute_cov(amp_actives_window):
     return sum(covs) / len(covs), active_idx
 
 
+def mean_profile(frames):
+    """
+    Per-subcarrier mean amplitude over frames [(amps, actives)], plus the
+    mask of subcarriers active in every frame. All frames must share one PHY
+    config (same vector length).
+    """
+    mask = window_active_mask([actives for _, actives in frames])
+    n = len(mask)
+    total = [0.0] * n
+    for amps, _ in frames:
+        for i in range(n):
+            total[i] += amps[i]
+    return [t / len(frames) for t in total], mask
+
+
+def shape_distance(prof_a, prof_b, mask):
+    """
+    RMS difference between two amplitude profiles after each is divided by
+    its own mean over the masked subcarriers. Dividing out the mean removes
+    the ESP32's AGC gain, which rescales every subcarrier together and would
+    otherwise look like presence; only the shape across subcarriers -- what
+    a body in the room actually changes -- is compared.
+    """
+    idx = [i for i, ok in enumerate(mask) if ok]
+    if len(idx) < 8:
+        return None
+    ma = sum(prof_a[i] for i in idx) / len(idx)
+    mb = sum(prof_b[i] for i in idx) / len(idx)
+    if ma <= 0 or mb <= 0:
+        return None
+    return (sum((prof_a[i] / ma - prof_b[i] / mb) ** 2 for i in idx) / len(idx)) ** 0.5
+
+
+def build_fingerprint(frames, phy_key):
+    """
+    Empty-room fingerprint from frames [(t, amps, actives)] of one PHY config.
+
+    The capture is split into PRESENCE_WINDOW_S chunks and each chunk is
+    scored against the mean of all the *other* chunks (leave-one-out), so
+    the spread matches what the live score -- a fresh window against a
+    reference it wasn't part of -- shows when the room is empty.
+    Returns the fingerprint dict, or None if the capture was too short.
+    """
+    if not frames:
+        return None
+    t0 = frames[0][0]
+    chunks = defaultdict(list)
+    for t, amps, actives in frames:
+        chunks[int((t - t0) // PRESENCE_WINDOW_S)].append((amps, actives))
+    chunks = [c for c in chunks.values() if len(c) >= MIN_FRAMES_PER_WINDOW]
+    if len(chunks) < MIN_FINGERPRINT_CHUNKS:
+        return None
+
+    all_frames = [f for c in chunks for f in c]
+    profile, mask = mean_profile(all_frames)
+    n_all = len(all_frames)
+    total = [p * n_all for p in profile]
+
+    scores = []
+    for c in chunks:
+        chunk_prof, _ = mean_profile(c)
+        n_rest = n_all - len(c)
+        rest = [(total[i] - chunk_prof[i] * len(c)) / n_rest for i in range(len(total))]
+        s = shape_distance(chunk_prof, rest, mask)
+        if s is not None:
+            scores.append(s)
+    if len(scores) < MIN_FINGERPRINT_CHUNKS:
+        return None
+
+    m = sum(scores) / len(scores)
+    std = (sum((s - m) ** 2 for s in scores) / len(scores)) ** 0.5
+    return {
+        "phy": list(phy_key),
+        "profile": [round(p, 4) for p in profile],
+        "mask": mask,
+        "score_mean": m,
+        "score_std": std,
+        "n_chunks": len(scores),
+    }
+
+
+def presence_state(mac_str):
+    """
+    Live static-presence score for one link vs its fingerprint. Called under lock.
+    Returns {score, threshold, present} or {present: None, reason} when no
+    comparison is possible.
+    """
+    fp = (baseline.get(mac_str) or {}).get("fingerprint")
+    if not fp:
+        return {"present": None, "reason": "no fingerprint"}
+    if list(win_phy_key.get(mac_str, ())) != fp["phy"]:
+        return {"present": None, "reason": "PHY differs from fingerprint"}
+    now = time.time()
+    frames = [(a, m) for t, a, m in presence_frames[mac_str] if now - t <= PRESENCE_WINDOW_S]
+    if len(frames) < MIN_FRAMES_PER_WINDOW:
+        return {"present": None, "reason": "too few packets"}
+    profile, mask = mean_profile(frames)
+    if len(profile) != len(fp["profile"]):
+        return {"present": None, "reason": "PHY differs from fingerprint"}
+    mask = [a and b for a, b in zip(mask, fp["mask"])]
+    score = shape_distance(profile, fp["profile"], mask)
+    if score is None:
+        return {"present": None, "reason": "too few active subcarriers"}
+    threshold = max(fp["score_mean"] + PRESENCE_K * max(fp["score_std"], 1e-4),
+                    fp["score_mean"] * PRESENCE_MIN_RATIO)
+    return {"score": round(score, 5), "threshold": round(threshold, 5), "present": score > threshold}
+
+
 def udp_listener(host, port):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((host, port))
@@ -588,6 +720,7 @@ def udp_listener(host, port):
         amps, actives = iq_to_amplitude(values)
 
         with lock:
+            now = time.time()
             # Reset the window on any change to length or PHY parameters --
             # amplitudes are only comparable within one constant configuration.
             win = amp_windows[mac_str]
@@ -595,10 +728,12 @@ def udp_listener(host, port):
             if win and win_phy_key.get(mac_str) != phy_key:
                 win.clear()
                 heatmap_hist[mac_str].clear()
+                presence_frames[mac_str].clear()
             win_phy_key[mac_str] = phy_key
 
             amp_windows[mac_str].append((amps, actives))
             heatmap_hist[mac_str].append(amps)
+            presence_frames[mac_str].append((now, amps, actives))
 
             cov, active_idx = compute_cov(list(amp_windows[mac_str]))
             active_set = set(active_idx)
@@ -607,8 +742,8 @@ def udp_listener(host, port):
 
             if baseline_capture["active"]:
                 baseline_capture["samples"][mac_str].append(cov)
+                baseline_capture["frames"][mac_str].append((now, amps, actives, phy_key))
 
-            now = time.time()
             m = meta.setdefault(mac_str, {"pkt_count": 0})
             m.update(rssi=rssi, noise=noise, sig_mode=sig_mode, rate=rate,
                       mcs=mcs, cwb=cwb, channel=ch, secondary=sec,
@@ -623,6 +758,7 @@ def udp_listener(host, port):
 
 def emitter_loop():
     """Push a compact snapshot to all connected clients at EMIT_HZ."""
+    global last_occupied_t
     period = 1.0 / EMIT_HZ
     while True:
         time.sleep(period)
@@ -631,6 +767,8 @@ def emitter_loop():
                 continue
             payload = {}
             mac_covs = {}
+            detected_by = []    # (mac, "motion"|"presence") for every link firing this tick
+            any_checked = False
             for mac_str, m in meta.items():
                 n_sub = len(null_mask_cache.get(mac_str, []))
                 active_idx = [i for i, a in enumerate(null_mask_cache.get(mac_str, [])) if a]
@@ -645,6 +783,14 @@ def emitter_loop():
                 if base is not None and base["mean"] is not None:
                     threshold = base["mean"] + 3 * base["std"]
                     motion = cur_cov > threshold
+                presence = presence_state(mac_str)
+
+                if motion is not None or presence["present"] is not None:
+                    any_checked = True
+                if motion:
+                    detected_by.append((mac_str, "motion"))
+                if presence["present"]:
+                    detected_by.append((mac_str, "presence"))
 
                 mac_covs[mac_str] = cur_cov
                 payload[mac_str] = {
@@ -659,13 +805,26 @@ def emitter_loop():
                     "cov_series": cov_series,
                     "cur_cov": cur_cov,
                     "heatmap": heat_active,
-                    "baseline": base,
+                    # CoV stats only -- the fingerprint profile isn't needed per tick
+                    "baseline": {k: base.get(k) for k in ("mean", "std", "n")} if base else None,
                     "motion": motion,
+                    "presence": presence,
                 }
+
+            # Room is occupied if any link sees motion or a static presence,
+            # held for PRESENCE_HOLD_S so a brief dip doesn't flicker it to empty.
+            now = time.time()
+            if detected_by:
+                last_occupied_t = now
+            room = {
+                "occupied": (now - last_occupied_t <= PRESENCE_HOLD_S) if any_checked else None,
+                "detected_by": [{"mac": mac, "kind": kind} for mac, kind in detected_by],
+            }
 
             loc = compute_localization(mac_covs, baseline)
             socketio.emit("csi_update", payload)
             socketio.emit("localization", loc)
+            socketio.emit("room_presence", room)
 
 
 @app.route("/")
@@ -685,7 +844,7 @@ def handle_connect():
 
 @socketio.on("start_baseline")
 def handle_start_baseline(data):
-    duration = float(data.get("duration", 8))
+    duration = float(data.get("duration", 60))
     delay = float(data.get("delay", 30))
 
     with lock:
@@ -705,10 +864,12 @@ def handle_start_baseline(data):
             baseline_capture["active"] = True
             baseline_capture["until"] = time.time() + duration
             baseline_capture["samples"] = defaultdict(list)
+            baseline_capture["frames"] = defaultdict(list)
         socketio.emit("baseline_status", {"phase": "capturing", "duration": duration})
 
         time.sleep(duration)
 
+        no_fingerprint = []
         with lock:
             baseline_capture["active"] = False
             for mac_str, samples in baseline_capture["samples"].items():
@@ -716,9 +877,29 @@ def handle_start_baseline(data):
                     m = sum(samples) / len(samples)
                     var = sum((x - m) ** 2 for x in samples) / len(samples)
                     std = var ** 0.5
-                    baseline[mac_str] = {"mean": m, "std": std, "n": len(samples)}
+                    entry = {"mean": m, "std": std, "n": len(samples)}
+
+                    # Fingerprint from the dominant PHY config only -- amplitudes
+                    # from different configs aren't comparable.
+                    frames = baseline_capture["frames"][mac_str]
+                    phy_counts = defaultdict(int)
+                    for f in frames:
+                        phy_counts[f[3]] += 1
+                    fp = None
+                    if phy_counts:
+                        phy = max(phy_counts, key=phy_counts.get)
+                        fp = build_fingerprint([f[:3] for f in frames if f[3] == phy], phy)
+                    if fp:
+                        entry["fingerprint"] = fp
+                    else:
+                        no_fingerprint.append(mac_str)
+                        print(f"[baseline] {mac_str}: capture too short for a presence fingerprint "
+                              f"(need >= {MIN_FINGERPRINT_CHUNKS * PRESENCE_WINDOW_S:.0f}s)", flush=True)
+                    baseline[mac_str] = entry
+            baseline_capture["frames"] = defaultdict(list)
             save_baseline()
-        socketio.emit("baseline_status", {"phase": "done", "baseline": baseline})
+        socketio.emit("baseline_status", {"phase": "done", "baseline": baseline,
+                                          "no_fingerprint": no_fingerprint})
 
     def run():
         try:

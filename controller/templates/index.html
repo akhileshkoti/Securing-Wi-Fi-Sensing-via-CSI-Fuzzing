@@ -138,6 +138,22 @@
             color: var(--ok);
         }
 
+        .pill.present {
+            background: var(--accent);
+            color: #04101a;
+        }
+
+        .pills {
+            display: flex;
+            gap: 6px;
+        }
+
+        #room-occupancy {
+            font-size: 12px;
+            padding: 3px 10px;
+            font-weight: 600;
+        }
+
         .meta-row {
             color: var(--muted);
             font-size: 11px;
@@ -254,13 +270,14 @@
 
     <header>
         <h1>CSI SENSING &mdash; LIVE</h1>
+        <span class="pill" id="room-occupancy" title="Occupied if any link sees motion or static presence">room: --</span>
         <div class="controls">
             <span id="status">connecting...</span>
             <span style="color:var(--panel-border)">|</span>
             <label style="color:var(--muted)">leave-room delay (s): <input type="number" id="baselineDelay" value="30"
                     min="0" max="120"></label>
-            <label style="color:var(--muted)">duration (s): <input type="number" id="baselineDur" value="8" min="2"
-                    max="60"></label>
+            <label style="color:var(--muted)">duration (s): <input type="number" id="baselineDur" value="60" min="2"
+                    max="300" title="Presence detection needs at least 15s; 60s+ recommended"></label>
             <button class="primary" id="btnBaseline">Capture baseline (empty room)</button>
             <button class="danger" id="btnClear">Clear baseline</button>
         </div>
@@ -335,7 +352,7 @@
         socket.on('disconnect', () => { statusEl.textContent = 'disconnected'; });
 
         document.getElementById('btnBaseline').onclick = () => {
-            const dur = parseFloat(document.getElementById('baselineDur').value) || 8;
+            const dur = parseFloat(document.getElementById('baselineDur').value) || 60;
             const delay = parseFloat(document.getElementById('baselineDelay').value) || 30;
             socket.emit('start_baseline', { duration: dur, delay: delay });
         };
@@ -351,7 +368,9 @@
             } else if (s.phase === 'capturing') {
                 statusEl.textContent = `capturing baseline, keep room empty (${s.duration}s)`;
             } else if (s.phase === 'done') {
-                statusEl.textContent = 'baseline captured — connected';
+                statusEl.textContent = (s.no_fingerprint && s.no_fingerprint.length)
+                    ? `baseline captured, but too short for presence on ${s.no_fingerprint.join(', ')} — use 15s+`
+                    : 'baseline captured — connected';
             } else if (s.phase === 'loaded') {
                 statusEl.textContent = 'room baseline loaded — connected';
             } else if (s.phase === 'cleared') {
@@ -374,7 +393,10 @@
             el.innerHTML = `
     <div class="card-head">
       <span class="mac">${mac}</span>
-      <span class="pill" id="pill-${mac}">--</span>
+      <span class="pills">
+        <span class="pill" id="ppill-${mac}" title="Static presence: subcarrier shape vs empty-room fingerprint">--</span>
+        <span class="pill" id="pill-${mac}" title="Motion: CoV vs baseline">--</span>
+      </span>
     </div>
     <div class="meta-row" id="meta-${mac}"></div>
     <canvas class="heatmap" id="heat-${mac}" width="200" height="100"></canvas>
@@ -468,7 +490,21 @@
       <span>rate ${d.rate}</span>
       <span>active subcarriers ${d.n_active_subcarriers}/${d.n_total_subcarriers}</span>
       <span>pkts ${d.pkt_count}</span>
+      ${d.presence.score !== undefined
+          ? `<span>shape Δ ${d.presence.score.toFixed(4)} / thr ${d.presence.threshold.toFixed(4)}</span>` : ''}
     `;
+
+                const ppill = document.getElementById(`ppill-${mac}`);
+                if (d.presence.present === null) {
+                    ppill.textContent = d.presence.reason;
+                    ppill.className = 'pill';
+                } else if (d.presence.present) {
+                    ppill.textContent = 'PRESENT';
+                    ppill.className = 'pill present';
+                } else {
+                    ppill.textContent = 'empty';
+                    ppill.className = 'pill still';
+                }
 
                 const pill = document.getElementById(`pill-${mac}`);
                 if (d.baseline) {
@@ -497,6 +533,21 @@
                 c.chart.update();
 
                 drawHeatmap(c.heatCanvas, d.heatmap);
+            }
+        });
+
+        const roomOcc = document.getElementById('room-occupancy');
+        socket.on('room_presence', (r) => {
+            if (r.occupied === null) {
+                roomOcc.textContent = 'room: no baseline';
+                roomOcc.className = 'pill';
+            } else if (r.occupied) {
+                const kinds = [...new Set(r.detected_by.map(d => d.kind))];
+                roomOcc.textContent = kinds.length ? `room: OCCUPIED (${kinds.join(' + ')})` : 'room: OCCUPIED';
+                roomOcc.className = 'pill present';
+            } else {
+                roomOcc.textContent = 'room: empty';
+                roomOcc.className = 'pill still';
             }
         });
 
@@ -614,25 +665,25 @@
                 }
             }
 
-            // blob — presence dot
+            // blob — position estimate. Fixed size: blob.confidence is the
+            // normalised heat peak (always ~1.0), not a real certainty, so
+            // scaling by it just drew every estimate at maximum size.
             if (loc && loc.blob) {
                 const [bx, by] = toCanvas(loc.blob.x, loc.blob.y);
-                const conf = loc.blob.confidence;
-                const radius = 8 + conf * 14;
-                // glow
-                const grad = roomCtx.createRadialGradient(bx, by, 0, bx, by, radius * 2);
-                grad.addColorStop(0, `rgba(255,200,50,${conf * 0.9})`);
-                grad.addColorStop(0.4, `rgba(255,100,50,${conf * 0.5})`);
+                const grad = roomCtx.createRadialGradient(bx, by, 0, bx, by, 14);
+                grad.addColorStop(0, 'rgba(255,200,50,0.6)');
                 grad.addColorStop(1, 'rgba(255,100,50,0)');
                 roomCtx.beginPath();
-                roomCtx.arc(bx, by, radius * 2, 0, Math.PI * 2);
+                roomCtx.arc(bx, by, 14, 0, Math.PI * 2);
                 roomCtx.fillStyle = grad;
                 roomCtx.fill();
-                // core dot
                 roomCtx.beginPath();
-                roomCtx.arc(bx, by, radius, 0, Math.PI * 2);
-                roomCtx.fillStyle = `rgba(255,210,60,${0.7 + conf * 0.3})`;
+                roomCtx.arc(bx, by, 5, 0, Math.PI * 2);
+                roomCtx.fillStyle = 'rgb(255,210,60)';
                 roomCtx.fill();
+                roomCtx.strokeStyle = '#0b0d12';
+                roomCtx.lineWidth = 1.5;
+                roomCtx.stroke();
             }
 
             // nodes -- out-of-room nodes are pinned to the nearest edge and
@@ -687,7 +738,7 @@
                 } else if (!loc.blob) {
                     locStatus.textContent = `${loc.active_links} links active — no motion above threshold`;
                 } else {
-                    locStatus.textContent = `Position estimate: (${loc.blob.x.toFixed(2)}m E, ${loc.blob.y.toFixed(2)}m N)  confidence ${(loc.blob.confidence * 100).toFixed(0)}%`;
+                    locStatus.textContent = `Position estimate: (${loc.blob.x.toFixed(2)}m E, ${loc.blob.y.toFixed(2)}m N)`;
                 }
             }
         }
