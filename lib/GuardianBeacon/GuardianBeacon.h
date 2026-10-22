@@ -6,9 +6,9 @@
 // slots carried "guardian noise" versus genuine Illuminator traffic -- the
 // core trick behind the CSI-fuzzing defense (Objective 3).
 //
-// Kept deliberately separate from the Illuminator/Receiver/Controller
-// pipeline that's already built and tested -- this prototype does not
-// touch CsiCollector, EspNowBeacon, NetConfig, or app.py. See
+// Selected like any other role via the captive portal (Role::Guardian);
+// main.cpp calls begin()/loop() the same way it does for EspNowBeacon and
+// CsiCollector. It does not touch those classes' own logic. See
 // controller/fuzzing_eval.py for the matching schedule function and the
 // protection/degradation evaluation this feeds.
 class GuardianBeacon {

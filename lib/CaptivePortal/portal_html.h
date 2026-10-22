@@ -98,6 +98,7 @@ const char PORTAL_FORM_HTML[] PROGMEM = R"rawliteral(
         <select name="role" id="role" onchange="toggleServer()">
             <option value="Illuminator">Illuminator</option>
             <option value="Receiver">Receiver</option>
+            <option value="Guardian">Guardian</option>
         </select>
 
         <div id="serverRow">

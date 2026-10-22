@@ -2,11 +2,12 @@
 #include <Arduino.h>
 
 // The data the user enters in the captive portal.
-enum class Role { Unknown, Illuminator, Receiver };
+enum class Role { Unknown, Illuminator, Receiver, Guardian };
 
 inline Role roleFromString(const String &s) {
   if (s == "Illuminator") return Role::Illuminator;
   if (s == "Receiver")    return Role::Receiver;
+  if (s == "Guardian")    return Role::Guardian;
   return Role::Unknown;
 }
 
@@ -14,6 +15,7 @@ inline const char *roleToString(Role r) {
   switch (r) {
     case Role::Illuminator: return "Illuminator";
     case Role::Receiver:    return "Receiver";
+    case Role::Guardian:    return "Guardian";
     default:                return "Unknown";
   }
 }

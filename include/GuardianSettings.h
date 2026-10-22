@@ -1,15 +1,10 @@
 #pragma once
 #include <cstdint>
 
-// Standalone configuration for the Guardian prototype board (CSI-fuzzing
-// defense, Objective 3). Deliberately kept separate from Settings.h /
-// NetConfig.h -- this is an isolated experiment and must not risk the
-// already-tested Illuminator/Receiver pipeline. Edit the Wi-Fi credentials
-// below before flashing; there is no captive portal for this board.
+// Tunables for the Guardian role (CSI-fuzzing defense, Objective 3).
+// Wi-Fi credentials come from the captive portal / NetConfig like every
+// other role -- only the PRNG schedule parameters live here.
 namespace GuardianSettings {
-  constexpr char WIFI_SSID[] = "YOUR_WIFI_SSID";
-  constexpr char WIFI_PASS[] = "YOUR_WIFI_PASSWORD";
-
   // Shared secret: must match the --seed given to controller/fuzzing_eval.py
   // for the same capture session. Whoever does not know this value cannot
   // predict which slots carry guardian noise -- that asymmetry is the

@@ -7,6 +7,8 @@
 #include "Discovery.h"
 #include "EspNowBeacon.h"
 #include "CsiCollector.h"
+#include "GuardianBeacon.h"
+#include "GuardianSettings.h"
 
 // --- Collaborators (composition root) ---
 ConfigStore   store;
@@ -22,6 +24,7 @@ bool      g_portalMode = false;
 
 EspNowBeacon beacon;
 CsiCollector csi;
+GuardianBeacon guardian;
 
 // Wipe config if the reset pin is held LOW at boot.
 static bool resetRequested() {
@@ -39,6 +42,8 @@ static void startApplication() {
     IPAddress controller;
     controller.fromString(g_cfg.serverIp);
     csi.begin(controller, Settings::CONTROLLER_PORT);
+  } else if (g_cfg.role == Role::Guardian) {
+    guardian.begin(GuardianSettings::PRNG_SEED);  // PRNG-scheduled bursts; see GuardianSettings.h
   } else {  // Illuminator
     beacon.begin();                             // ESP-NOW broadcast; no IP/mDNS needed
   }
@@ -65,6 +70,7 @@ void setup() {
 
 void loop() {
   if (g_portalMode) { portal.loop(); return; }
-  if (g_cfg.role == Role::Receiver) csi.loop();
-  else                              beacon.loop();
+  if      (g_cfg.role == Role::Receiver) csi.loop();
+  else if (g_cfg.role == Role::Guardian) guardian.loop();
+  else                                   beacon.loop();
 }
