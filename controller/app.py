@@ -25,7 +25,15 @@ from flask import Flask, render_template
 from flask_socketio import SocketIO
 
 HDR = 18
-WINDOW_FRAMES = 50          # ~1s at ~50Hz, per your validated motion-window size
+# The CoV window is time-based, not frame-count-based: with a fixed frame
+# count, the window only represents ~1s of real time if the per-link packet
+# rate actually holds at ~50Hz. With multiple Illuminators (and the
+# Guardian) sharing one channel, the real rate can drop well below that --
+# a fixed 50-frame window then silently stretches to many seconds of lag.
+WINDOW_SECONDS      = 1.0   # the window always covers this much real time, regardless of rate
+MIN_WINDOW_FRAMES   = 5     # floor: keep at least this many samples even if they're older than WINDOW_SECONDS,
+                             # so CoV doesn't become degenerate when the rate is very low
+MAX_WINDOW_FRAMES   = 500   # safety cap on memory if the rate spikes
 HEATMAP_HISTORY = 200       # columns of amplitude history kept per illuminator
 EMIT_HZ = 10                # throttle UI updates regardless of packet rate
 
@@ -496,7 +504,7 @@ def layout_payload():
     }
 
 # Per-MAC state
-amp_windows = defaultdict(lambda: deque(maxlen=WINDOW_FRAMES))       # recent amplitude vectors (non-null subcarriers)
+amp_windows = defaultdict(lambda: deque(maxlen=MAX_WINDOW_FRAMES))   # (timestamp, amps, actives) -- time-pruned to WINDOW_SECONDS, see udp_listener
 heatmap_hist = defaultdict(lambda: deque(maxlen=HEATMAP_HISTORY))    # recent amplitude vectors for heatmap
 cov_history = defaultdict(lambda: deque(maxlen=HEATMAP_HISTORY))     # recent CoV scalar values
 presence_frames = defaultdict(lambda: deque(maxlen=2000))            # (t, amps, actives) for the presence window
@@ -731,11 +739,18 @@ def udp_listener(host, port):
                 presence_frames[mac_str].clear()
             win_phy_key[mac_str] = phy_key
 
-            amp_windows[mac_str].append((amps, actives))
+            win.append((now, amps, actives))
+            # Keep the window to WINDOW_SECONDS of real time, not a fixed frame
+            # count, so CoV responsiveness doesn't silently degrade when the
+            # per-link packet rate drops (more nodes sharing the channel, etc.).
+            # MIN_WINDOW_FRAMES is a floor so a very low rate doesn't leave too
+            # few samples for a meaningful std/mean.
+            while len(win) > MIN_WINDOW_FRAMES and now - win[0][0] > WINDOW_SECONDS:
+                win.popleft()
             heatmap_hist[mac_str].append(amps)
             presence_frames[mac_str].append((now, amps, actives))
 
-            cov, active_idx = compute_cov(list(amp_windows[mac_str]))
+            cov, active_idx = compute_cov([(a, ac) for _, a, ac in win])
             active_set = set(active_idx)
             null_mask_cache[mac_str] = [i in active_set for i in range(len(amps))]
             cov_history[mac_str].append(cov)
