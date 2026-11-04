@@ -519,6 +519,20 @@ last_occupied_t = 0.0      # time of the last per-link motion/presence detection
 # as-is for offline/standalone use; this is purely additive.
 fuzzing_capture = {"active": False, "records": []}
 
+# Live (continuously updating) legitimate-vs-eavesdropper comparison, as an
+# alternative to the one-shot fuzzing_capture above. Two rolling windows are
+# maintained in parallel over the SAME incoming stream, both pruned to
+# WINDOW_SECONDS: fuzz_live_eaves_window gets every record, fuzz_live_legit
+# only the ones not in a guardian-burst slot (per the live seed). Because
+# both cover the same real-time span, this gives a genuinely time-aligned
+# comparison -- unlike the one-shot capture's post-hoc merged series, where
+# the blanked series has fewer points and drifts out of alignment.
+fuzz_live = {"active": False, "seed": None, "burst_probability": 0.15}  # matches FUZZ_DEFAULT_BURST_PROBABILITY below
+fuzz_live_eaves_window = deque()
+fuzz_live_legit_window = deque()
+fuzz_live_eaves_history = deque(maxlen=HEATMAP_HISTORY)
+fuzz_live_legit_history = deque(maxlen=HEATMAP_HISTORY)
+
 null_mask_cache = {}       # mac -> boolean numpy-free list, True = active subcarrier
 win_phy_key = {}           # mac -> (n_amps, sig_mode, rate, mcs, cwb) of current window's frames
 
@@ -838,6 +852,19 @@ def udp_listener(host, port):
                 # No filtering: that's the point, see handle_start_fuzzing_capture.
                 fuzzing_capture["records"].append((now, mac_str, amps, actives))
 
+            if fuzz_live["active"]:
+                fuzz_live_eaves_window.append((now, amps, actives))
+                while (len(fuzz_live_eaves_window) > MIN_WINDOW_FRAMES
+                       and now - fuzz_live_eaves_window[0][0] > WINDOW_SECONDS):
+                    fuzz_live_eaves_window.popleft()
+
+                slot = int(now * 1000 // FUZZ_SLOT_MS)
+                if not fuzz_is_burst_slot(fuzz_live["seed"], slot, fuzz_live["burst_probability"]):
+                    fuzz_live_legit_window.append((now, amps, actives))
+                    while (len(fuzz_live_legit_window) > MIN_WINDOW_FRAMES
+                           and now - fuzz_live_legit_window[0][0] > WINDOW_SECONDS):
+                        fuzz_live_legit_window.popleft()
+
             m = meta.setdefault(mac_str, {"pkt_count": 0})
             m.update(rssi=rssi, noise=noise, sig_mode=sig_mode, rate=rate,
                       mcs=mcs, cwb=cwb, channel=ch, secondary=sec,
@@ -919,6 +946,20 @@ def emitter_loop():
             socketio.emit("csi_update", payload)
             socketio.emit("localization", loc)
             socketio.emit("room_presence", room)
+
+            if fuzz_live["active"]:
+                eaves_cov, _ = compute_cov([(a, ac) for _, a, ac in fuzz_live_eaves_window])
+                legit_cov, _ = compute_cov([(a, ac) for _, a, ac in fuzz_live_legit_window])
+                fuzz_live_eaves_history.append(eaves_cov)
+                fuzz_live_legit_history.append(legit_cov)
+                socketio.emit("fuzzing_live_update", {
+                    "legit_cov": round(legit_cov, 5),
+                    "eaves_cov": round(eaves_cov, 5),
+                    "legit_series": list(fuzz_live_legit_history),
+                    "eaves_series": list(fuzz_live_eaves_history),
+                    "n_legit_window": len(fuzz_live_legit_window),
+                    "n_eaves_window": len(fuzz_live_eaves_window),
+                })
 
 
 @app.route("/")
@@ -1206,6 +1247,41 @@ def handle_start_fuzzing_capture(data):
                 busy_tasks.discard("fuzzing_capture")
 
     threading.Thread(target=run, daemon=True).start()
+
+
+@socketio.on("start_fuzzing_live")
+def handle_start_fuzzing_live(data):
+    """
+    data: { seed: <int, required>, burst_probability: <float, default 0.15> }
+    Continuously-updating alternative to start_fuzzing_capture: two rolling
+    windows (legitimate/eavesdropper) are maintained in udp_listener over
+    the same live stream, both genuinely time-aligned since they cover the
+    same WINDOW_SECONDS span -- emitter_loop pushes both every tick via
+    "fuzzing_live_update" until stop_fuzzing_live is called.
+    """
+    try:
+        seed = int(data["seed"])
+    except (KeyError, TypeError, ValueError):
+        socketio.emit("fuzzing_eval_status", {"phase": "error", "message": "seed is required"})
+        return
+    burst_probability = float(data.get("burst_probability", 0.15))
+
+    with lock:
+        fuzz_live["active"] = True
+        fuzz_live["seed"] = seed
+        fuzz_live["burst_probability"] = burst_probability
+        fuzz_live_eaves_window.clear()
+        fuzz_live_legit_window.clear()
+        fuzz_live_eaves_history.clear()
+        fuzz_live_legit_history.clear()
+    socketio.emit("fuzzing_eval_status", {"phase": "live_started"})
+
+
+@socketio.on("stop_fuzzing_live")
+def handle_stop_fuzzing_live():
+    with lock:
+        fuzz_live["active"] = False
+    socketio.emit("fuzzing_eval_status", {"phase": "live_stopped"})
 
 
 @socketio.on("remove_node")
