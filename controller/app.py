@@ -647,6 +647,16 @@ def fuzz_summarize(series):
             "cv": round(std / m, 3) if m else None}
 
 
+def fuzz_downsample(series, max_points=400):
+    """Evenly-spaced downsample for charting -- keeps the payload small
+    regardless of capture duration/rate."""
+    series = [round(s, 5) for s in series if s is not None]
+    if len(series) <= max_points:
+        return series
+    step = len(series) / max_points
+    return [series[int(i * step)] for i in range(max_points)]
+
+
 def mean_profile(frames):
     """
     Per-subcarrier mean amplitude over frames [(amps, actives)], plus the
@@ -1156,12 +1166,16 @@ def handle_start_fuzzing_capture(data):
             })
             return
 
-        legit_scoped = fuzz_summarize(fuzz_replay_cov_series(
-            illum_records, blank_bursts=False, seed=seed, burst_probability=burst_probability))
-        legit_merged = fuzz_summarize(fuzz_replay_cov_series(
-            all_records, blank_bursts=True, seed=seed, burst_probability=burst_probability))
-        eaves_merged = fuzz_summarize(fuzz_replay_cov_series(
-            all_records, blank_bursts=False, seed=seed, burst_probability=burst_probability))
+        legit_scoped_series = fuzz_replay_cov_series(
+            illum_records, blank_bursts=False, seed=seed, burst_probability=burst_probability)
+        legit_merged_series = fuzz_replay_cov_series(
+            all_records, blank_bursts=True, seed=seed, burst_probability=burst_probability)
+        eaves_merged_series = fuzz_replay_cov_series(
+            all_records, blank_bursts=False, seed=seed, burst_probability=burst_probability)
+
+        legit_scoped = fuzz_summarize(legit_scoped_series)
+        legit_merged = fuzz_summarize(legit_merged_series)
+        eaves_merged = fuzz_summarize(eaves_merged_series)
 
         burst_count = sum(
             1 for ts, _, _ in all_records
@@ -1176,6 +1190,12 @@ def handle_start_fuzzing_capture(data):
             "legitimate_scoped": legit_scoped,
             "legitimate_merged_blanked": legit_merged,
             "eavesdropper_merged": eaves_merged,
+            # Downsampled series for the side-by-side chart -- (2) vs (3) is
+            # the actual protection/degradation comparison; (1) included too
+            # since it's cheap and useful context.
+            "series_legitimate_scoped": fuzz_downsample(legit_scoped_series),
+            "series_legitimate_merged_blanked": fuzz_downsample(legit_merged_series),
+            "series_eavesdropper_merged": fuzz_downsample(eaves_merged_series),
         })
 
     def run():

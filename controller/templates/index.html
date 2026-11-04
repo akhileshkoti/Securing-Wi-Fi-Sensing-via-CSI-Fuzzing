@@ -389,6 +389,9 @@
             the room. Reads live from whatever's already flowing through this dashboard -- no separate file needed.
         </div>
         <div id="fuzz-results"></div>
+        <div id="fuzz-chart-wrap" style="height:220px; margin-top:14px; display:none;">
+            <canvas id="fuzz-chart"></canvas>
+        </div>
     </div>
 
     <div id="grid"></div>
@@ -934,6 +937,51 @@
             </div></div>`;
         }
 
+        let fuzzChart = null;
+        function updateFuzzChart(s) {
+            const wrap = document.getElementById('fuzz-chart-wrap');
+            const legit = s.series_legitimate_merged_blanked || [];
+            const eaves = s.series_eavesdropper_merged || [];
+            if (!legit.length && !eaves.length) { wrap.style.display = 'none'; return; }
+            wrap.style.display = 'block';
+
+            const n = Math.max(legit.length, eaves.length);
+            const labels = Array.from({ length: n }, (_, i) => i);
+
+            if (!fuzzChart) {
+                const ctx = document.getElementById('fuzz-chart').getContext('2d');
+                fuzzChart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: [],
+                        datasets: [
+                            { label: 'Legitimate (merged + blanked)', data: [], borderColor: '#4ade80',
+                              borderWidth: 1.5, pointRadius: 0, tension: 0.15 },
+                            { label: 'Eavesdropper (merged, unblanked)', data: [], borderColor: '#ff6b6b',
+                              borderWidth: 1.5, pointRadius: 0, tension: 0.15 },
+                        ],
+                    },
+                    options: {
+                        animation: false,
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            x: { title: { display: true, text: 'sample # (not aligned to real time -- see note below)',
+                                          color: '#8b93a3', font: { size: 10 } }, display: true,
+                                 ticks: { color: '#8b93a3', font: { size: 9 } }, grid: { color: '#1f2430' } },
+                            y: { title: { display: true, text: 'CoV', color: '#8b93a3', font: { size: 10 } },
+                                 ticks: { color: '#8b93a3', font: { size: 9 } }, grid: { color: '#1f2430' } },
+                        },
+                        plugins: { legend: { labels: { color: '#8b93a3', font: { size: 10 } } } },
+                    },
+                });
+            }
+            fuzzChart.data.labels = labels;
+            fuzzChart.data.datasets[0].data = legit;
+            fuzzChart.data.datasets[1].data = eaves;
+            fuzzChart.update();
+        }
+
         socket.on('fuzzing_eval_status', (s) => {
             const status = document.getElementById('fuzz-status');
             const results = document.getElementById('fuzz-results');
@@ -944,11 +992,14 @@
             } else if (s.phase === 'done') {
                 const pct = s.n_total_records ? (100 * s.n_burst_records / s.n_total_records).toFixed(1) : '0';
                 status.textContent = `captured ${s.n_total_records} record(s) (${s.n_illuminator_records} Illuminator, `
-                    + `${pct}% in a guardian-burst slot)`;
+                    + `${pct}% in a guardian-burst slot). Chart x-axis is sample index, not wall-clock time -- `
+                    + `the blanked series has fewer points, so the two lines drift out of real-time alignment `
+                    + `the further right you look; compare their shape/spread, not point-by-point.`;
                 results.innerHTML =
                     fuzzStatRow('1) Legitimate, MAC-scoped (today’s real pipeline)', s.legitimate_scoped) +
                     fuzzStatRow('2) Legitimate, merged + PRNG-blanked', s.legitimate_merged_blanked) +
                     fuzzStatRow('3) Eavesdropper, merged, nothing blanked', s.eavesdropper_merged);
+                updateFuzzChart(s);
             }
         });
 
