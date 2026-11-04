@@ -512,6 +512,13 @@ meta = {}                  # mac -> dict(rssi, noise, sig_mode, rate, mcs, cwb, 
 baseline_capture = {"active": False, "until": 0.0, "samples": defaultdict(list), "frames": defaultdict(list)}
 last_occupied_t = 0.0      # time of the last per-link motion/presence detection, for the room-level hold
 
+# In-dashboard CSI-fuzzing evaluation (Objective 3/4) -- records every incoming
+# (timestamp, mac, amps, actives) during a capture window, the same raw data
+# controller/fuzzing_eval.py works from, but captured live instead of via
+# csi_server.py + a separate CSV replay step. fuzzing_eval.py is left exactly
+# as-is for offline/standalone use; this is purely additive.
+fuzzing_capture = {"active": False, "records": []}
+
 null_mask_cache = {}       # mac -> boolean numpy-free list, True = active subcarrier
 win_phy_key = {}           # mac -> (n_amps, sig_mode, rate, mcs, cwb) of current window's frames
 
@@ -582,6 +589,62 @@ def compute_cov(amp_actives_window):
     if not covs:
         return 0.0, []
     return sum(covs) / len(covs), active_idx
+
+
+# ---------------------------------------------------------------------------
+# In-dashboard CSI-fuzzing evaluation (Objective 3/4). slot_hash()/
+# is_burst_slot() must stay byte-for-byte equivalent to GuardianBeacon.cpp's
+# slotHash() and controller/fuzzing_eval.py's copy -- duplicated deliberately
+# in all three places rather than shared, same reasoning as fuzzing_eval.py's
+# module docstring. See that file for the full explanation of why a merged,
+# undifferentiated stream (not the Illuminator's own always-clean log) is
+# the comparison that actually exercises the PRNG-blanking logic.
+# ---------------------------------------------------------------------------
+FUZZ_SLOT_MS = 20
+FUZZ_DEFAULT_BURST_PROBABILITY = 0.15
+
+
+def fuzz_slot_hash(seed, slot):
+    h = (seed ^ slot) & 0xFFFFFFFF
+    h ^= h >> 16
+    h = (h * 0x7feb352d) & 0xFFFFFFFF
+    h ^= h >> 15
+    h = (h * 0x846ca68b) & 0xFFFFFFFF
+    h ^= h >> 16
+    return h
+
+
+def fuzz_is_burst_slot(seed, slot, burst_probability):
+    threshold = int(burst_probability * 4294967296.0)
+    return fuzz_slot_hash(seed, slot) < threshold
+
+
+def fuzz_replay_cov_series(records, blank_bursts, seed, burst_probability):
+    """records: [(timestamp, amps, actives), ...], already time-ordered.
+    Mirrors app.py's own WINDOW_SECONDS/MIN_WINDOW_FRAMES pruning."""
+    window = deque()
+    series = []
+    for ts, amps, actives in records:
+        slot = int(ts * 1000 // FUZZ_SLOT_MS)
+        if blank_bursts and fuzz_is_burst_slot(seed, slot, burst_probability):
+            continue
+        window.append((ts, amps, actives))
+        while len(window) > MIN_WINDOW_FRAMES and ts - window[0][0] > WINDOW_SECONDS:
+            window.popleft()
+        cov, _ = compute_cov([(a, ac) for _, a, ac in window])
+        series.append(cov)
+    return series
+
+
+def fuzz_summarize(series):
+    series = [s for s in series if s is not None]
+    if not series:
+        return None
+    m = sum(series) / len(series)
+    var = sum((x - m) ** 2 for x in series) / len(series)
+    std = var ** 0.5
+    return {"n": len(series), "mean": round(m, 5), "std": round(std, 5),
+            "cv": round(std / m, 3) if m else None}
 
 
 def mean_profile(frames):
@@ -758,6 +821,12 @@ def udp_listener(host, port):
             if baseline_capture["active"]:
                 baseline_capture["samples"][mac_str].append(cov)
                 baseline_capture["frames"][mac_str].append((now, amps, actives, phy_key))
+
+            if fuzzing_capture["active"]:
+                # Records from every source that reaches here -- Illuminators
+                # and, once CsiCollector.cpp forwards it, the Guardian too.
+                # No filtering: that's the point, see handle_start_fuzzing_capture.
+                fuzzing_capture["records"].append((now, mac_str, amps, actives))
 
             m = meta.setdefault(mac_str, {"pkt_count": 0})
             m.update(rssi=rssi, noise=noise, sig_mode=sig_mode, rate=rate,
@@ -1031,6 +1100,90 @@ def handle_calibrate_scale(data):
         finally:
             with lock:
                 busy_tasks.discard("calibration")
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+@socketio.on("start_fuzzing_capture")
+def handle_start_fuzzing_capture(data):
+    """
+    data: { duration: <seconds, default 20>, seed: <int, required>,
+            burst_probability: <float, default 0.15> }
+
+    Records every incoming CSI record (Illuminators and, once
+    CsiCollector.cpp forwards it, the Guardian) for `duration` seconds, then
+    replays that one capture three ways -- see fuzzing_eval.py's module
+    docstring for why a single capture is enough and why the merged,
+    undifferentiated view (not the Illuminator's own always-clean log) is
+    the comparison that actually means something:
+      1) legitimate, MAC-scoped  -- today's real pipeline (Illuminator
+         records only; never had Guardian noise mixed in to begin with)
+      2) legitimate, merged + blanked -- all records, burst-slot ones
+         excluded using the known schedule
+      3) eavesdropper, merged, unblanked -- all records, nothing removed
+    (2) vs (3) is the actual protection/degradation evidence.
+    """
+    try:
+        seed = int(data["seed"])
+    except (KeyError, TypeError, ValueError):
+        socketio.emit("fuzzing_eval_status", {"phase": "error", "message": "seed is required"})
+        return
+    duration = float(data.get("duration", 20))
+    burst_probability = float(data.get("burst_probability", FUZZ_DEFAULT_BURST_PROBABILITY))
+
+    with lock:
+        busy_tasks.add("fuzzing_capture")
+    socketio.emit("fuzzing_eval_status", {"phase": "capturing", "duration": duration})
+
+    def capture():
+        with lock:
+            fuzzing_capture["active"] = True
+            fuzzing_capture["records"] = []
+
+        time.sleep(duration)
+
+        with lock:
+            fuzzing_capture["active"] = False
+            records = list(fuzzing_capture["records"])
+
+        illum_records = [(ts, a, ac) for ts, mac, a, ac in records if mac in NODE_POSITIONS]
+        all_records = sorted(((ts, a, ac) for ts, mac, a, ac in records), key=lambda r: r[0])
+
+        if not records:
+            socketio.emit("fuzzing_eval_status", {
+                "phase": "failed",
+                "message": "no CSI records captured during the window -- check the boards are transmitting",
+            })
+            return
+
+        legit_scoped = fuzz_summarize(fuzz_replay_cov_series(
+            illum_records, blank_bursts=False, seed=seed, burst_probability=burst_probability))
+        legit_merged = fuzz_summarize(fuzz_replay_cov_series(
+            all_records, blank_bursts=True, seed=seed, burst_probability=burst_probability))
+        eaves_merged = fuzz_summarize(fuzz_replay_cov_series(
+            all_records, blank_bursts=False, seed=seed, burst_probability=burst_probability))
+
+        burst_count = sum(
+            1 for ts, _, _ in all_records
+            if fuzz_is_burst_slot(seed, int(ts * 1000 // FUZZ_SLOT_MS), burst_probability)
+        )
+
+        socketio.emit("fuzzing_eval_status", {
+            "phase": "done",
+            "n_illuminator_records": len(illum_records),
+            "n_total_records": len(all_records),
+            "n_burst_records": burst_count,
+            "legitimate_scoped": legit_scoped,
+            "legitimate_merged_blanked": legit_merged,
+            "eavesdropper_merged": eaves_merged,
+        })
+
+    def run():
+        try:
+            capture()
+        finally:
+            with lock:
+                busy_tasks.discard("fuzzing_capture")
 
     threading.Thread(target=run, daemon=True).start()
 

@@ -176,7 +176,7 @@
             height: 120px;
         }
 
-        #room-panel {
+        #room-panel, #fuzz-panel {
             margin: 0 20px 20px 20px;
             background: var(--panel);
             border: 1px solid var(--panel-border);
@@ -184,13 +184,51 @@
             padding: 16px;
         }
 
-        #room-panel h2 {
+        #room-panel h2, #fuzz-panel h2 {
             font-size: 12px;
             color: var(--muted);
             margin: 0 0 12px 0;
             font-weight: 400;
             letter-spacing: 1px;
             text-transform: uppercase;
+        }
+
+        #fuzz-panel .row {
+            display: flex;
+            gap: 10px;
+            align-items: flex-end;
+            flex-wrap: wrap;
+            margin-bottom: 10px;
+        }
+
+        #fuzz-panel .row input[type=number] {
+            width: 70px;
+        }
+
+        #fuzz-results {
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+            margin-top: 10px;
+        }
+
+        #fuzz-results .stat {
+            min-width: 220px;
+            padding: 10px 12px;
+            border-radius: 8px;
+            background: var(--bg);
+            border: 1px solid var(--panel-border);
+        }
+
+        #fuzz-results .stat .label {
+            font-size: 11px;
+            color: var(--muted);
+            margin-bottom: 4px;
+        }
+
+        #fuzz-results .stat .nums {
+            font-family: monospace;
+            font-size: 12px;
         }
 
         #room-wrap {
@@ -336,6 +374,21 @@
                 </div>
             </div>
         </div>
+    </div>
+
+    <div id="fuzz-panel">
+        <h2>CSI Fuzzing Evaluation (Objective 3/4)</h2>
+        <div class="row">
+            <label>seed<input type="number" id="fuzz-seed" step="1" value="1234567"
+                    title="Must match GuardianSettings::PRNG_SEED"></label>
+            <label>duration (s)<input type="number" id="fuzz-dur" step="1" value="20" min="5" max="120"></label>
+            <button class="primary" onclick="startFuzzingCapture()">Start Capture</button>
+        </div>
+        <div id="fuzz-status" style="font-size:12px; color:var(--muted); margin-bottom:6px;">
+            Make sure the Illuminators, Guardian, and Receiver are all active, then capture a session while walking
+            the room. Reads live from whatever's already flowing through this dashboard -- no separate file needed.
+        </div>
+        <div id="fuzz-results"></div>
     </div>
 
     <div id="grid"></div>
@@ -862,6 +915,40 @@
                 el.textContent = `elongation_scale = ${s.scale} (from room profile)`;
             } else if (s.phase === 'failed' || s.phase === 'error') {
                 el.textContent = s.message;
+            }
+        });
+
+        // ── CSI fuzzing evaluation (Objective 3/4) ──────────────────────────────────
+        function startFuzzingCapture() {
+            const seed = parseInt(document.getElementById('fuzz-seed').value, 10);
+            const duration = parseFloat(document.getElementById('fuzz-dur').value) || 20;
+            if (isNaN(seed)) { alert('Enter the PRNG seed (must match GuardianSettings::PRNG_SEED)'); return; }
+            document.getElementById('fuzz-results').innerHTML = '';
+            socket.emit('start_fuzzing_capture', { seed, duration });
+        }
+
+        function fuzzStatRow(label, stat) {
+            if (!stat) return `<div class="stat"><div class="label">${label}</div><div class="nums">no samples</div></div>`;
+            return `<div class="stat"><div class="label">${label}</div><div class="nums">
+                n=${stat.n}  mean=${stat.mean}  std=${stat.std}  cv=${stat.cv ?? 'n/a'}
+            </div></div>`;
+        }
+
+        socket.on('fuzzing_eval_status', (s) => {
+            const status = document.getElementById('fuzz-status');
+            const results = document.getElementById('fuzz-results');
+            if (s.phase === 'capturing') {
+                status.textContent = `capturing for ${s.duration}s -- keep all boards active and walk the room`;
+            } else if (s.phase === 'failed' || s.phase === 'error') {
+                status.textContent = s.message;
+            } else if (s.phase === 'done') {
+                const pct = s.n_total_records ? (100 * s.n_burst_records / s.n_total_records).toFixed(1) : '0';
+                status.textContent = `captured ${s.n_total_records} record(s) (${s.n_illuminator_records} Illuminator, `
+                    + `${pct}% in a guardian-burst slot)`;
+                results.innerHTML =
+                    fuzzStatRow('1) Legitimate, MAC-scoped (today’s real pipeline)', s.legitimate_scoped) +
+                    fuzzStatRow('2) Legitimate, merged + PRNG-blanked', s.legitimate_merged_blanked) +
+                    fuzzStatRow('3) Eavesdropper, merged, nothing blanked', s.eavesdropper_merged);
             }
         });
 
