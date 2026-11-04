@@ -9,42 +9,51 @@
 namespace {
   volatile uint32_t s_espnowRx = 0;   // ESP-NOW frames received
 
-  // Illuminator MACs learned from their "ILU,<id>,<seq>" beacon payload
-  // (EspNowBeacon.cpp). onCsi() only forwards frames from these sources --
+  // MACs learned from a known beacon payload prefix -- "ILU,<id>,<seq>" for
+  // Illuminators (EspNowBeacon.cpp) or "GRD,<slot>,<seq>" for the Guardian
+  // (GuardianBeacon.cpp). onCsi() only forwards frames from these sources --
   // otherwise the CSI callback fires for *any* frame the radio receives on
   // this channel (AP traffic, neighboring devices, etc.), which pollutes
   // the sensing pipeline with sources that were never part of the geometry.
-  constexpr uint8_t kMaxIlluminators = 8;
-  uint8_t s_illuminatorMacs[kMaxIlluminators][6];
-  uint8_t s_illuminatorCount = 0;
+  //
+  // The Guardian is included here deliberately: its whole point is to be
+  // captured and logged like any other source, so that a full capture
+  // contains the undifferentiated mix an eavesdropper would also see.
+  // Its MAC must never be added to the controller's NODE_POSITIONS --
+  // that's a separate, controller-side concern and happens naturally
+  // since nobody enters a position for it on the dashboard.
+  constexpr uint8_t kMaxKnownSources = 8;
+  uint8_t s_knownMacs[kMaxKnownSources][6];
+  uint8_t s_knownCount = 0;
 
-  bool isKnownIlluminator(const uint8_t *mac) {
-    for (uint8_t i = 0; i < s_illuminatorCount; i++) {
-      if (memcmp(s_illuminatorMacs[i], mac, 6) == 0) return true;
+  bool isKnownSource(const uint8_t *mac) {
+    for (uint8_t i = 0; i < s_knownCount; i++) {
+      if (memcmp(s_knownMacs[i], mac, 6) == 0) return true;
     }
     return false;
   }
 
-  void registerIlluminator(const uint8_t *mac) {
-    if (isKnownIlluminator(mac)) return;
-    if (s_illuminatorCount >= kMaxIlluminators) return;
-    memcpy(s_illuminatorMacs[s_illuminatorCount], mac, 6);
-    s_illuminatorCount++;
-    Serial.printf("[CSI] registered illuminator %02X:%02X:%02X:%02X:%02X:%02X\n",
+  void registerKnownSource(const uint8_t *mac) {
+    if (isKnownSource(mac)) return;
+    if (s_knownCount >= kMaxKnownSources) return;
+    memcpy(s_knownMacs[s_knownCount], mac, 6);
+    s_knownCount++;
+    Serial.printf("[CSI] registered source %02X:%02X:%02X:%02X:%02X:%02X\n",
                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   }
 
-  // Accept the Illuminators' ESP-NOW frames so the stack processes them,
-  // and learn their MACs so onCsi() can scope capture to known sources.
+  // Accept the Illuminators' and Guardian's ESP-NOW frames so the stack
+  // processes them, and learn their MACs so onCsi() can scope capture to
+  // known sources.
   void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
     s_espnowRx++;
-    if (len >= 4 && memcmp(data, "ILU,", 4) == 0) {
-      registerIlluminator(mac);
+    if (len >= 4 && (memcmp(data, "ILU,", 4) == 0 || memcmp(data, "GRD,", 4) == 0)) {
+      registerKnownSource(mac);
     }
   }
 
   struct CsiRecord {
-    uint8_t  mac[6];        // source MAC = which illuminator
+    uint8_t  mac[6];        // source MAC = which Illuminator or the Guardian
     int8_t   rssi;
     int8_t   noise_floor;
     uint8_t  sig_mode;      // 0=legacy(11g), 1=HT(11n), 3=VHT
@@ -63,7 +72,7 @@ namespace {
   // Wi-Fi task context: keep minimal, just copy + enqueue.
   void onCsi(void *ctx, wifi_csi_info_t *info) {
     if (!s_queue || !info || !info->buf || info->len == 0) return;
-    if (!isKnownIlluminator(info->mac)) return;   // not one of our illuminators
+    if (!isKnownSource(info->mac)) return;   // not one of our Illuminators or the Guardian
     s_csiCount++;
     const wifi_pkt_rx_ctrl_t &rx = info->rx_ctrl;
     CsiRecord r;
@@ -101,7 +110,7 @@ void CsiCollector::begin(IPAddress controllerIp, uint16_t port) {
   esp_wifi_set_csi_rx_cb(&onCsi, nullptr);
   esp_wifi_set_csi(true);
 
-  // Receive side of ESP-NOW so the Illuminators' frames are accepted.
+  // Receive side of ESP-NOW so the Illuminators' and Guardian's frames are accepted.
   if (esp_now_init() == ESP_OK) {
     esp_now_register_recv_cb(onEspNowRecv);
   }
