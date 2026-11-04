@@ -961,6 +961,29 @@ def emitter_loop():
                     "n_eaves_window": len(fuzz_live_eaves_window),
                 })
 
+                # Spatial side-by-side: a second localization pass where each
+                # Illuminator's own CoV is blended with whatever non-Illuminator
+                # (i.e. Guardian) traffic is currently in its own window --
+                # simulating an eavesdropper who, generously, has your exact
+                # node geometry and baseline but can't separate Guardian noise
+                # from real motion the way the MAC-scoped pipeline does. Reuses
+                # compute_localization() unchanged -- same function, different
+                # (contaminated) input.
+                guardian_macs = [m for m in meta if m not in NODE_POSITIONS]
+                guardian_frames = []
+                for gm in guardian_macs:
+                    guardian_frames.extend(amp_windows.get(gm, []))
+
+                eaves_mac_covs = {}
+                for illum_mac in NODE_POSITIONS:
+                    illum_frames = list(amp_windows.get(illum_mac, []))
+                    merged = illum_frames + guardian_frames
+                    cov, _ = compute_cov([(a, ac) for _, a, ac in merged])
+                    eaves_mac_covs[illum_mac] = cov
+
+                eaves_loc = compute_localization(eaves_mac_covs, baseline)
+                socketio.emit("localization_eavesdropper", eaves_loc)
+
 
 @app.route("/")
 def index():

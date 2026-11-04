@@ -243,7 +243,7 @@
             flex-shrink: 0;
         }
 
-        #room-canvas {
+        #room-canvas, #fuzz-room-legit, #fuzz-room-eaves {
             display: block;
             border: 1px solid var(--panel-border);
             border-radius: 4px;
@@ -400,6 +400,25 @@
                 chart above). <span id="fuzz-live-n"></span>
             </div>
             <canvas id="fuzz-live-chart"></canvas>
+        </div>
+        <div id="fuzz-rooms-wrap" style="display:none; margin-top:14px;">
+            <div style="font-size:11px; color:var(--muted); margin-bottom:6px;">
+                Spatial comparison -- same node geometry and baseline fed to both; the eavesdropper side
+                generously assumes it somehow has your geometry too, and just can't filter Guardian noise
+                out of its own per-link readings the way the real pipeline does.
+            </div>
+            <div style="display:flex; gap:20px; flex-wrap:wrap;">
+                <div>
+                    <div style="font-size:11px; color:#4ade80; margin-bottom:4px;">Legitimate (your real pipeline)</div>
+                    <canvas id="fuzz-room-legit" width="300" height="533"></canvas>
+                    <div id="fuzz-loc-status-legit" style="font-size:11px; color:var(--muted); margin-top:4px;"></div>
+                </div>
+                <div>
+                    <div style="font-size:11px; color:#ff6b6b; margin-bottom:4px;">Eavesdropper (degraded, generous assumption)</div>
+                    <canvas id="fuzz-room-eaves" width="300" height="533"></canvas>
+                    <div id="fuzz-loc-status-eaves" style="font-size:11px; color:var(--muted); margin-top:4px;"></div>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -617,8 +636,6 @@
         });
 
         // ── Room Visualization ──────────────────────────────────────────────────────
-        const roomCanvas = document.getElementById('room-canvas');
-        const roomCtx = roomCanvas.getContext('2d');
         const locStatus = document.getElementById('loc-status');
 
         // Room real dimensions (metres) — kept in sync with server via layout_ack
@@ -627,25 +644,12 @@
         // number of pixels on both axes (a fixed 300x533 box stretched any
         // room that wasn't 9:16). The room is fit inside this bounding box.
         const CANVAS_MAX_W = 300, CANVAS_MAX_H = 533;
-        let CANVAS_W = CANVAS_MAX_W, CANVAS_H = CANVAS_MAX_H;
         // Positions within this distance of a wall count as on the wall, so
         // a node tape-measured onto the wall doesn't trip the warning.
         const WALL_TOLERANCE_M = 0.01;
         // Latest layout from layout_ack; nodes are drawn from this so they
         // show (and the warning updates) even before any CSI packets arrive.
         let layoutNodes = [];
-
-        function resizeRoomCanvas() {
-            const scale = Math.min(CANVAS_MAX_W / roomW, CANVAS_MAX_H / roomH);
-            const w = Math.max(1, Math.round(roomW * scale));
-            const h = Math.max(1, Math.round(roomH * scale));
-            if (w === CANVAS_W && h === CANVAS_H) return;
-            CANVAS_W = w;
-            CANVAS_H = h;
-            // assigning width/height clears the canvas; the caller redraws
-            roomCanvas.width = w;
-            roomCanvas.height = h;
-        }
 
         function isOutside(node) {
             return node.x < -WALL_TOLERANCE_M || node.x > roomW + WALL_TOLERANCE_M ||
@@ -668,151 +672,189 @@
             warnEl.style.display = 'block';
         }
 
-        function toCanvas(x, y) {
-            // world (x=east, y=north) -> canvas (origin top-left, y flipped)
-            return [
-                Math.round(x / roomW * CANVAS_W),
-                Math.round((1 - y / roomH) * CANVAS_H)
-            ];
-        }
+        // Factory so the same drawing logic serves multiple canvases (the
+        // primary room view, plus the eavesdropper/legitimate spatial
+        // comparison) -- each instance keeps its own canvas size state, but
+        // all read the shared roomW/roomH/layoutNodes above (same physical
+        // room and nodes either way; only the localization result differs).
+        function makeRoomView(canvas, statusEl) {
+            const ctx = canvas.getContext('2d');
+            let CANVAS_W = CANVAS_MAX_W, CANVAS_H = CANVAS_MAX_H;
 
-        function drawRoom(loc) {
-            resizeRoomCanvas();
-            roomCtx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+            function resize() {
+                const scale = Math.min(CANVAS_MAX_W / roomW, CANVAS_MAX_H / roomH);
+                const w = Math.max(1, Math.round(roomW * scale));
+                const h = Math.max(1, Math.round(roomH * scale));
+                if (w === CANVAS_W && h === CANVAS_H) return;
+                CANVAS_W = w;
+                CANVAS_H = h;
+                canvas.width = w;   // assigning width/height clears the canvas; draw() redraws
+                canvas.height = h;
+            }
 
-            // background
-            roomCtx.fillStyle = '#0b0d12';
-            roomCtx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+            function toCanvasXY(x, y) {
+                // world (x=east, y=north) -> canvas (origin top-left, y flipped)
+                return [Math.round(x / roomW * CANVAS_W), Math.round((1 - y / roomH) * CANVAS_H)];
+            }
 
-            // presence heatmap grid
-            if (loc && loc.scores && loc.scores.length > 0) {
-                const nx = loc.grid_n_x, ny = loc.grid_n_y;
-                const cellW = CANVAS_W / nx;
-                const cellH = CANVAS_H / ny;
-                for (let gy = 0; gy < ny; gy++) {
-                    for (let gx = 0; gx < nx; gx++) {
-                        const score = loc.scores[gy * nx + gx];
-                        if (score < 0.05) continue;
-                        const alpha = score * 0.7;
-                        // blue->cyan->yellow based on score
-                        const r = Math.round(255 * Math.min(1, score * 2));
-                        const g = Math.round(180 * score);
-                        const b = Math.round(255 * (1 - score));
-                        roomCtx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
-                        // canvas y is flipped relative to world y
-                        const cx = gx * cellW;
-                        const cy = (ny - 1 - gy) * cellH;
-                        roomCtx.fillRect(cx, cy, cellW + 1, cellH + 1);
+            function draw(loc) {
+                resize();
+                ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+
+                ctx.fillStyle = '#0b0d12';
+                ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+                // presence heatmap grid
+                if (loc && loc.scores && loc.scores.length > 0) {
+                    const nx = loc.grid_n_x, ny = loc.grid_n_y;
+                    const cellW = CANVAS_W / nx;
+                    const cellH = CANVAS_H / ny;
+                    for (let gy = 0; gy < ny; gy++) {
+                        for (let gx = 0; gx < nx; gx++) {
+                            const score = loc.scores[gy * nx + gx];
+                            if (score < 0.05) continue;
+                            const alpha = score * 0.7;
+                            const r = Math.round(255 * Math.min(1, score * 2));
+                            const g = Math.round(180 * score);
+                            const b = Math.round(255 * (1 - score));
+                            ctx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
+                            const cx = gx * cellW;
+                            const cy = (ny - 1 - gy) * cellH;
+                            ctx.fillRect(cx, cy, cellW + 1, cellH + 1);
+                        }
+                    }
+                }
+
+                ctx.strokeStyle = '#1f2430';
+                ctx.lineWidth = 2;
+                ctx.strokeRect(1, 1, CANVAS_W - 2, CANVAS_H - 2);
+
+                // bistatic ellipses
+                if (loc && loc.ellipses) {
+                    for (const ell of loc.ellipses) {
+                        if (!ell.pts || ell.pts.length < 2) continue;
+                        ctx.beginPath();
+                        const [sx, sy] = toCanvasXY(ell.pts[0][0], ell.pts[0][1]);
+                        ctx.moveTo(sx, sy);
+                        for (let i = 1; i < ell.pts.length; i++) {
+                            const [px, py] = toCanvasXY(ell.pts[i][0], ell.pts[i][1]);
+                            ctx.lineTo(px, py);
+                        }
+                        ctx.closePath();
+                        ctx.strokeStyle = ell.excess > 0 ? 'rgba(255,107,107,0.5)' : 'rgba(94,198,255,0.2)';
+                        ctx.lineWidth = ell.excess > 0 ? 1.5 : 0.5;
+                        ctx.stroke();
+                    }
+                }
+
+                // blob — position estimate. Fixed size: blob.confidence is the
+                // normalised heat peak (always ~1.0), not a real certainty, so
+                // scaling by it just drew every estimate at maximum size.
+                if (loc && loc.blob) {
+                    const [bx, by] = toCanvasXY(loc.blob.x, loc.blob.y);
+                    const grad = ctx.createRadialGradient(bx, by, 0, bx, by, 14);
+                    grad.addColorStop(0, 'rgba(255,200,50,0.6)');
+                    grad.addColorStop(1, 'rgba(255,100,50,0)');
+                    ctx.beginPath();
+                    ctx.arc(bx, by, 14, 0, Math.PI * 2);
+                    ctx.fillStyle = grad;
+                    ctx.fill();
+                    ctx.beginPath();
+                    ctx.arc(bx, by, 5, 0, Math.PI * 2);
+                    ctx.fillStyle = 'rgb(255,210,60)';
+                    ctx.fill();
+                    ctx.strokeStyle = '#0b0d12';
+                    ctx.lineWidth = 1.5;
+                    ctx.stroke();
+                }
+
+                // nodes -- out-of-room nodes are pinned to the nearest edge and
+                // ringed in red so they stay visible instead of vanishing off-canvas
+                for (const node of layoutNodes) {
+                    const outside = isOutside(node);
+                    let [nx, ny] = toCanvasXY(node.x, node.y);
+                    nx = Math.min(Math.max(nx, 8), CANVAS_W - 8);
+                    ny = Math.min(Math.max(ny, 8), CANVAS_H - 8);
+                    if (outside) {
+                        ctx.beginPath();
+                        ctx.arc(nx, ny, 11, 0, Math.PI * 2);
+                        ctx.strokeStyle = '#ff6b6b';
+                        ctx.lineWidth = 2;
+                        ctx.stroke();
+                    }
+                    ctx.beginPath();
+                    if (node.type === 'rx') {
+                        ctx.moveTo(nx, ny - 8);
+                        ctx.lineTo(nx + 7, ny);
+                        ctx.lineTo(nx, ny + 8);
+                        ctx.lineTo(nx - 7, ny);
+                        ctx.closePath();
+                        ctx.fillStyle = '#4ade80';
+                        ctx.fill();
+                    } else {
+                        ctx.arc(nx, ny, 7, 0, Math.PI * 2);
+                        ctx.fillStyle = '#5ec6ff';
+                        ctx.fill();
+                    }
+                    ctx.fillStyle = '#e6e8ec';
+                    ctx.font = '10px monospace';
+                    ctx.fillText(node.label, nx + 9, ny + 4);
+                }
+
+                // compass / scale
+                ctx.fillStyle = '#8b93a3';
+                ctx.font = '9px monospace';
+                ctx.fillText('N', CANVAS_W / 2 - 3, 12);
+                ctx.fillText('S', CANVAS_W / 2 - 3, CANVAS_H - 4);
+                ctx.fillText(`${roomH.toFixed(1)}m`, 4, CANVAS_H / 2);
+                ctx.fillText(`${roomW.toFixed(1)}m`, CANVAS_W - 30, CANVAS_H - 4);
+
+                if (statusEl && loc) {
+                    if (loc.active_links === 0) {
+                        statusEl.textContent = 'Assign TX MACs to enable localization';
+                    } else if (loc.active_links === 1) {
+                        statusEl.textContent = `1 link active — ellipse shown, need 2 links for position estimate`;
+                    } else if (!loc.blob) {
+                        statusEl.textContent = `${loc.active_links} links active — no motion above threshold`;
+                    } else {
+                        statusEl.textContent = `Position estimate: (${loc.blob.x.toFixed(2)}m E, ${loc.blob.y.toFixed(2)}m N)`;
                     }
                 }
             }
 
-            // room outline
-            roomCtx.strokeStyle = '#1f2430';
-            roomCtx.lineWidth = 2;
-            roomCtx.strokeRect(1, 1, CANVAS_W - 2, CANVAS_H - 2);
-
-            // bistatic ellipses
-            if (loc && loc.ellipses) {
-                for (const ell of loc.ellipses) {
-                    if (!ell.pts || ell.pts.length < 2) continue;
-                    roomCtx.beginPath();
-                    const [sx, sy] = toCanvas(ell.pts[0][0], ell.pts[0][1]);
-                    roomCtx.moveTo(sx, sy);
-                    for (let i = 1; i < ell.pts.length; i++) {
-                        const [px, py] = toCanvas(ell.pts[i][0], ell.pts[i][1]);
-                        roomCtx.lineTo(px, py);
-                    }
-                    roomCtx.closePath();
-                    roomCtx.strokeStyle = ell.excess > 0 ? 'rgba(255,107,107,0.5)' : 'rgba(94,198,255,0.2)';
-                    roomCtx.lineWidth = ell.excess > 0 ? 1.5 : 0.5;
-                    roomCtx.stroke();
-                }
-            }
-
-            // blob — position estimate. Fixed size: blob.confidence is the
-            // normalised heat peak (always ~1.0), not a real certainty, so
-            // scaling by it just drew every estimate at maximum size.
-            if (loc && loc.blob) {
-                const [bx, by] = toCanvas(loc.blob.x, loc.blob.y);
-                const grad = roomCtx.createRadialGradient(bx, by, 0, bx, by, 14);
-                grad.addColorStop(0, 'rgba(255,200,50,0.6)');
-                grad.addColorStop(1, 'rgba(255,100,50,0)');
-                roomCtx.beginPath();
-                roomCtx.arc(bx, by, 14, 0, Math.PI * 2);
-                roomCtx.fillStyle = grad;
-                roomCtx.fill();
-                roomCtx.beginPath();
-                roomCtx.arc(bx, by, 5, 0, Math.PI * 2);
-                roomCtx.fillStyle = 'rgb(255,210,60)';
-                roomCtx.fill();
-                roomCtx.strokeStyle = '#0b0d12';
-                roomCtx.lineWidth = 1.5;
-                roomCtx.stroke();
-            }
-
-            // nodes -- out-of-room nodes are pinned to the nearest edge and
-            // ringed in red so they stay visible instead of vanishing off-canvas
-            for (const node of layoutNodes) {
-                const outside = isOutside(node);
-                let [nx, ny] = toCanvas(node.x, node.y);
-                nx = Math.min(Math.max(nx, 8), CANVAS_W - 8);
-                ny = Math.min(Math.max(ny, 8), CANVAS_H - 8);
-                if (outside) {
-                    roomCtx.beginPath();
-                    roomCtx.arc(nx, ny, 11, 0, Math.PI * 2);
-                    roomCtx.strokeStyle = '#ff6b6b';
-                    roomCtx.lineWidth = 2;
-                    roomCtx.stroke();
-                }
-                roomCtx.beginPath();
-                if (node.type === 'rx') {
-                    // diamond for RX
-                    roomCtx.moveTo(nx, ny - 8);
-                    roomCtx.lineTo(nx + 7, ny);
-                    roomCtx.lineTo(nx, ny + 8);
-                    roomCtx.lineTo(nx - 7, ny);
-                    roomCtx.closePath();
-                    roomCtx.fillStyle = '#4ade80';
-                    roomCtx.fill();
-                } else {
-                    // circle for TX
-                    roomCtx.arc(nx, ny, 7, 0, Math.PI * 2);
-                    roomCtx.fillStyle = '#5ec6ff';
-                    roomCtx.fill();
-                }
-                roomCtx.fillStyle = '#e6e8ec';
-                roomCtx.font = '10px monospace';
-                roomCtx.fillText(node.label, nx + 9, ny + 4);
-            }
-
-            // compass / scale
-            roomCtx.fillStyle = '#8b93a3';
-            roomCtx.font = '9px monospace';
-            roomCtx.fillText('N', CANVAS_W / 2 - 3, 12);
-            roomCtx.fillText('S', CANVAS_W / 2 - 3, CANVAS_H - 4);
-            roomCtx.fillText(`${roomH.toFixed(1)}m`, 4, CANVAS_H / 2);
-            roomCtx.fillText(`${roomW.toFixed(1)}m`, CANVAS_W - 30, CANVAS_H - 4);
-
-            // localization status
-            if (loc) {
-                if (loc.active_links === 0) {
-                    locStatus.textContent = 'Assign TX MACs to enable localization';
-                } else if (loc.active_links === 1) {
-                    locStatus.textContent = `1 link active — ellipse shown, need 2 links for position estimate`;
-                } else if (!loc.blob) {
-                    locStatus.textContent = `${loc.active_links} links active — no motion above threshold`;
-                } else {
-                    locStatus.textContent = `Position estimate: (${loc.blob.x.toFixed(2)}m E, ${loc.blob.y.toFixed(2)}m N)`;
-                }
-            }
+            return { draw };
         }
+
+        const primaryView = makeRoomView(document.getElementById('room-canvas'), locStatus);
+        // Lazily created on the first live-mode eavesdropper update; "legit"
+        // just redraws the exact same loc the main room panel already got
+        // (same source of truth), into the smaller comparison canvas.
+        let fuzzLegitView = null;
+        let fuzzEavesView = null;
+        let lastLoc = null;
 
         socket.on('localization', (loc) => {
             roomW = loc.room_w;
             roomH = loc.room_h;
+            lastLoc = loc;
             updateLayoutWarning();
-            drawRoom(loc);
+            primaryView.draw(loc);
+            if (fuzzLegitView) fuzzLegitView.draw(loc);
+        });
+
+        // ── Spatial legitimate-vs-eavesdropper comparison (live mode only) ──────────
+        socket.on('localization_eavesdropper', (loc) => {
+            if (!fuzzLegitView) {
+                fuzzLegitView = makeRoomView(
+                    document.getElementById('fuzz-room-legit'),
+                    document.getElementById('fuzz-loc-status-legit'));
+                fuzzEavesView = makeRoomView(
+                    document.getElementById('fuzz-room-eaves'),
+                    document.getElementById('fuzz-loc-status-eaves'));
+            }
+            document.getElementById('fuzz-rooms-wrap').style.display = 'block';
+            if (lastLoc) fuzzLegitView.draw(lastLoc);
+            fuzzEavesView.draw(loc);
         });
 
         socket.on('layout_ack', (data) => {
@@ -832,7 +874,7 @@
             // waiting for the next localization tick, which never comes if no
             // CSI is flowing. The old heatmap/ellipses are for the previous
             // geometry, so they're dropped until the next tick.
-            drawRoom(null);
+            primaryView.draw(null);
             if (data.rx_pos) {
                 document.getElementById('rx-x').value = data.rx_pos[0];
                 document.getElementById('rx-y').value = data.rx_pos[1];
@@ -1036,6 +1078,7 @@
                 fuzzLiveActive = false;
                 btn.textContent = 'Start Live View';
                 btn.classList.remove('danger');
+                document.getElementById('fuzz-rooms-wrap').style.display = 'none';
             }
         }
 
@@ -1134,7 +1177,7 @@
 
         // draw empty room on load
         addTxRow();   // start with one empty TX row
-        drawRoom(null);
+        primaryView.draw(null);
     </script>
 </body>
 
